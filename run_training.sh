@@ -22,6 +22,8 @@ python ./scripts/run_training.py \
     --segment-files /home/koustav.chandra/O3/productions/imbh/a4_initial/a4_INITIAL/results/1._analysis_time/1.01_segment_data/H1L1V1-INSP_SEGMENTS-1246824215-3850078.xml \
     --foreground-vetos /home/koustav.chandra/O3/productions/imbh/a4_initial/a4_INITIAL/segments/H1L1V1-FOREGROUND_CENSOR-1246824215-3850078.xml \
     --bank /home/koustav.chandra/O3/productions/imbh/a4_initial/a4_INITIAL/bank/H1L1V1-BANK2HDF-1246824215-3850078.hdf \
+    --trigger-output-file ./data/chunk4_triggers.hdf \
+    --injection-output-file ./data/chunk4_injections.hdf \
     --output-file ./data/net_chisq.npy \
     --sample-rate 2048 \
     --data-width 512. \

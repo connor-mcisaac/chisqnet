@@ -15,8 +15,10 @@ import glob
 _trigger_params = ['snr', 'chisq', 'chisq_dof', 'sg_chisq', 'end_time', 'template_id']
 _trigger_dtypes = ['f8', 'f8', 'i4', 'f8', 'f8', 'i4']
 
-_bank_params = ['mass1', 'mass2', 'spin1z', 'spin2z']
+_bank_params = ['mass1', 'mass2', 'spin1z', 'spin2z', 'template_duration']
 _bank_dtypes = ['f8', 'f8', 'f8', 'f8', 'f8']
+
+_temp_params = ['mass1', 'mass2', 'spin1z', 'spin2z', 'approximant']
 
 _inj_in_params = ['mass1', 'mass2',
                   'spin1x', 'spin1y', 'spin1z',
@@ -165,6 +167,44 @@ class TriggerList(object):
         trigs = self.triggers[ifo][lgc]
         return trigs
 
+    def write_to_hdf(self, fp):
+        with h5py.File(fp, 'w') as f:
+            for ifo in self.ifos:
+                i = f.create_group(ifo)
+                for p, d in zip(self._params, self._dtypes):
+                    data = self.triggers[ifo][p][:]
+                    if d.startswith('U'):
+                        data = data.astype('S')
+                    _ = i.create_dataset(p, data=data)
+            f.attrs['params'] = self._params
+            f.attrs['dtypes'] = self._dtypes
+            f.attrs['newsnr'] = self.newsnr
+
+    @classmethod
+    def read_from_hdf(cls, fp):
+        ob = cls.__new__(cls)
+        ob.triggers = {}
+        ob.nums = {}
+        with h5py.File(fp, 'r') as f:
+            ob._params = f.attrs['params']
+            ob._dtypes = f.attrs['dtypes']
+            ob.ifos = list(f.keys())
+            ob.newsnr = f.attrs['newsnr']
+            for ifo in f.keys():
+                num = None
+                for p, d in zip(ob._params, ob._dtypes):
+                    data = f[ifo][p][:]
+                    if num is None:
+                        num = len(data)
+                        record = np.zeros(num, dtype={'names': ob._params,
+                                                      'formats': ob._dtypes})
+                    if d.startswith('U'):
+                        data = data.astype('U')
+                    record[p] = data
+                ob.triggers[ifo] = record
+                ob.nums[ifo] = num
+        return ob
+
 
 class InjectionTriggers(TriggerList):
     
@@ -232,6 +272,24 @@ class InjectionTriggers(TriggerList):
 
         for ifo in self.ifos:
             self.triggers[ifo] = np.concatenate(self.triggers[ifo])
+
+    def write_to_hdf(self, fp):
+        super().write_to_hdf(fp)
+        with h5py.File(fp, 'a') as f:
+            f.attrs['inj_params'] = self._inj_params
+            f.attrs['inj_dtypes'] = self._inj_dtypes
+            f.attrs['trig_params'] = self._trig_params
+            f.attrs['trig_dtypes'] = self._trig_dtypes
+
+    @classmethod
+    def read_from_hdf(cls, fp):
+        ob = super().read_from_hdf(fp)
+        with h5py.File(fp, 'r') as f:
+            ob._inj_params = f.attrs['inj_params']
+            ob._inj_dtypes = f.attrs['inj_dtypes']
+            ob._trig_params = f.attrs['trig_params']
+            ob._trig_dtypes = f.attrs['trig_dtypes']
+        return ob
         
 
 def gather_segments(seg_files, seg_name, ifo):
@@ -250,7 +308,7 @@ class TemplateGen(object):
         self.length = length
 
     def generate_template(self, trig):
-        params = {p: trig[p] for p in _bank_params + ['approximant']}
+        params = {p: trig[p] for p in _temp_params}
         h, _ = get_fd_waveform(params,
                                delta_f=self.delta_f,
                                f_lower=self.f_lower)
@@ -301,7 +359,6 @@ class StrainGen(object):
         self.start_pad = start_pad
         self.end_pad = end_pad
         self.psd_width = psd_width
-        self.time = None
         self.times = None
         self.padded = None
         self.strain = None
@@ -352,6 +409,8 @@ class StrainGen(object):
     def get_cut(self, time, width):
         if time < self.times[0] or time > self.times[1]:
             raise ValueError("time must be within the loaded segment")
+        if width >= (self.times[1] - self.times[0]):
+            raise ValueError("width should be smaller than the loaded segment")
         left = min(time, self.times[1] - width)
         right = left + width
         strain = self.strain.time_slice(left - self.start_pad,

@@ -1,8 +1,9 @@
+import os
 import numpy as np
 import argparse
 import logging
 from preprocessing import TriggerList, InjectionTriggers, StrainGen, TemplateGen, BatchGen
-from filtering import MatchedFilter
+from filtering import MatchedFilter, ShiftTransform
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
@@ -21,6 +22,8 @@ parser.add_argument("--injection-approximants", nargs='+', required=True)
 parser.add_argument("--segment-files", nargs='+', required=True)
 parser.add_argument("--foreground-vetos", nargs='+', required=True)
 parser.add_argument("--bank", required=True)
+parser.add_argument("--trigger-output-file", required=True)
+parser.add_argument("--injection-output-file", required=True)
 parser.add_argument("--output-file", required=True)
 parser.add_argument("--sample-rate", type=int, default=2048)
 parser.add_argument("--data-width", type=float, default=512.)
@@ -38,23 +41,39 @@ else:
     log_level = logging.WARNING
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
-triggers = TriggerList(args.trigger_files)
-triggers.threshold_cut(6, 'snr')
-triggers.get_newsnr()
-triggers.threshold_cut(6, 'newsnr_sg')
-triggers.get_bank_params(args.bank)
-triggers.cluster_over_time(1.0, 'newsnr_sg')
-triggers.apply_segments(args.segment_files, "TRIGGERS_GENERATED")
-triggers.apply_segments(args.foreground_vetos, "closed_box", within=False)
+if not os.path.isfile(args.trigger_output_file):
+    logging.info("Reading triggers from pycbc workflow")
+    triggers = TriggerList(args.trigger_files)
+    triggers.threshold_cut(8, 'snr')
+    triggers.get_newsnr()
+    triggers.threshold_cut(8, 'newsnr_sg')
+    triggers.get_bank_params(args.bank)
+    triggers.cluster_over_time(1.0, 'newsnr_sg')
+    triggers.apply_segments(args.segment_files, "TRIGGERS_GENERATED")
+    triggers.apply_segments(args.foreground_vetos, "closed_box", within=False)
+    logging.info("Saving triggers to {0}".format(args.trigger_output_file))
+    triggers.write_to_hdf(args.trigger_output_file)
+    logging.info("Triggers saved")
+else:
+    logging.info("Loading triggers from {0}".format(args.trigger_output_file))
+    triggers = TriggerList.read_from_hdf(args.trigger_output_file)
 
-injections = InjectionTriggers(args.injection_dirs, args.injection_approximants)
-injections.threshold_cut(6, 'snr')
-injections.get_bank_params(args.bank)
-injections.get_newsnr()
-injections.threshold_cut(6, 'newsnr_sg')
-injections.cluster_over_time(1.0, 'newsnr_sg')
-injections.apply_segments(args.segment_files, "TRIGGERS_GENERATED")
-injections.apply_segments(args.foreground_vetos, "closed_box", within=False)
+if not os.path.isfile(args.injection_output_file):
+    logging.info("Reading injections from pycbc workflow")
+    injections = InjectionTriggers(args.injection_dirs, args.injection_approximants)
+    injections.threshold_cut(6, 'snr')
+    injections.get_bank_params(args.bank)
+    #injections.get_newsnr()
+    #injections.threshold_cut(6, 'newsnr_sg')
+    #injections.cluster_over_time(1.0, 'newsnr_sg')
+    injections.apply_segments(args.segment_files, "TRIGGERS_GENERATED")
+    injections.apply_segments(args.foreground_vetos, "closed_box", within=False)
+    logging.info("Saving injections to {0}".format(args.injection_output_file))
+    injections.write_to_hdf(args.injection_output_file)
+    logging.info("Injections saved")
+else:
+    logging.info("Loading injections from {0}".format(args.injection_output_file))
+    injections = InjectionTriggers.read_from_hdf(args.injection_output_file)
 
 logging.info("{0} noise triggers available".format(len(triggers.flatten())))
 logging.info("{0} injections available".format(len(injections.flatten())))
@@ -80,27 +99,14 @@ batch = BatchGen(gens, triggers, injections, templates, args.batch_size,
 
 match = MatchedFilter(freqs, 15., f_high)
 
-dt0s = np.array([1. * np.sin(2 * np.pi * i / args.shift_num) for i in range(args.shift_num)]) * 0.005
-dt1s = np.array([0.1 * dt0s[i] for i in range(args.shift_num)])
-dtps = np.array([0.1 for i in range(args.shift_num)])
+transform = ShiftTransform(args.shift_num, 2, 1e-2, 1e1, 500,
+                           freqs, 15., f_high)
 
-dt0s = tf.Variable(dt0s, trainable=True, dtype=tf.float64)
-dt1s = tf.Variable(dt1s, trainable=True, dtype=tf.float64)
-dtps = tf.Variable(dtps, trainable=True, dtype=tf.float64)
-
-df0s = np.array([1. * np.cos(2 * np.pi * i / args.shift_num) for i in range(args.shift_num)]) * 5.
-df1s = np.array([0.1 * df0s[i] for i in range(args.shift_num)])
-dfps = np.array([0.1 for i in range(args.shift_num)])
-
-df0s = tf.Variable(df0s, trainable=True, dtype=tf.float64)
-df1s = tf.Variable(df1s, trainable=True, dtype=tf.float64)
-dfps = tf.Variable(dfps, trainable=True, dtype=tf.float64)
-
-trainables = [dt0s, dt1s, dtps, df0s, df1s, dfps]
+trainables = [transform.dts, transform.dfs]
 
 chi2 = tfp.distributions.Chi2(tf.constant(1., dtype=tf.float64))
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=1e-6)
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-8)
 
 for i in range(args.batch_num):
     logging.info("Starting batch {0}".format(i))
@@ -116,31 +122,16 @@ for i in range(args.batch_num):
     mass = tf.convert_to_tensor(params["mass1"] + params["mass2"], dtype=tf.float64)
 
     logging.info("Batch inputs read")
-    mass = tf.expand_dims(mass, axis=-1)
-    mass = tf.repeat(mass, args.shift_num, axis=-1)
 
     with tf.GradientTape() as tape:
 
-        dt0s_batch = tf.expand_dims(dt0s, axis=0)
-        dt0s_batch = tf.repeat(dt0s_batch, args.batch_size, axis=0)
-        dt1s_batch = tf.expand_dims(dt1s, axis=0)
-        dt1s_batch = tf.repeat(dt1s_batch, args.batch_size, axis=0)
-        dtps_batch = tf.expand_dims(dtps, axis=0)
-        dtps_batch = tf.repeat(dtps_batch, args.batch_size, axis=0)
+        dts = transform.get_dt(mass)
+        dfs = transform.get_df(mass)
 
-        df0s_batch = tf.expand_dims(df0s, axis=0)
-        df0s_batch = tf.repeat(df0s_batch, args.batch_size, axis=0)
-        df1s_batch = tf.expand_dims(df1s, axis=0)
-        df1s_batch = tf.repeat(df1s_batch, args.batch_size, axis=0)
-        dfps_batch = tf.expand_dims(dfps, axis=0)
-        dfps_batch = tf.repeat(dfps_batch, args.batch_size, axis=0)
-
-        dts = dt0s_batch + dt1s_batch * (mass ** dtps_batch)
-        dfs = df0s_batch + df1s_batch * (mass ** dfps_batch)
-
-        chi_temps = match.shift_dt_df(temp, dts, dfs)
+        chi_temps = transform.shift_dt_df(temp, mass)
         logging.info("Templates shifted")
-        chi_orthos =  match.get_ortho(chi_temps, temp, psd)
+
+        chi_orthos =  transform.get_ortho(chi_temps, temp, psd)
         logging.info("Orthogonal templates created")
 
         snr = match(data, psd, temp)
@@ -153,7 +144,7 @@ for i in range(args.batch_num):
 
         chisq_thresh = tf.math.maximum(chisq, tf.ones_like(chisq, dtype=tf.float64))
 
-        snr_prime = snr / (chisq_thresh) ** 0.5
+        snr_prime = snr / chisq_thresh ** 0.5
 
         chisq_cut = [chisq[j, cut_idxs[j, 0]:cut_idxs[j, 1]] for j in range(args.batch_size)]
         snr_cut = [snr[j, cut_idxs[j, 0]:cut_idxs[j, 1]] for j in range(args.batch_size)]
@@ -178,10 +169,11 @@ for i in range(args.batch_num):
         num_inj = tf.math.reduce_sum(tf.cast(label, tf.float64)).numpy()
 
         trig_weight = tf.ones_like(label, dtype=tf.float64)
-        trig_weight *= 1. / (args.batch_size - num_inj)
+        trig_weight /= (args.batch_size - num_inj)
 
         inj_weight = tf.ones_like(label, dtype=tf.float64)
-        inj_weight *= 1. / num_inj
+        inj_num = tf.ones_like(label, dtype=tf.float64) * num_inj
+        inj_weight /= tf.maximum(inj_weight, inj_num)
 
         batch_loss = tf.where(label,
                               chi_logp * inj_weight,
@@ -191,6 +183,8 @@ for i in range(args.batch_num):
         logging.info("Loss calculated")
 
     gradients = tape.gradient(loss, trainables)
+    gradients = [tf.where(tf.math.is_nan(grad), tf.zeros_like(grad), grad)
+                 for grad in gradients]
     optimizer.apply_gradients(zip(gradients, trainables))
 
     logging.info("Gradients applied")
@@ -211,6 +205,7 @@ snr_prime_max = snr_prime_max.numpy()
 label = label.numpy()
 
 for i in range(args.batch_size):
+
     plt.figure(figsize=(16, 6))
     plt.plot(times, snr[i, :], alpha=0.75, label="snr")
     plt.plot(times, chisq[i, :], alpha=0.75, label="chisq")
@@ -221,19 +216,14 @@ for i in range(args.batch_size):
               + " SNR' = " + str(snr_prime_max[i]))
     plt.savefig('/home/connor.mcisaac/public_html/imbh/' + str(i) + '_snr.png')
 
-masses = np.linspace(100, 500, num=17, endpoint=True)
-dt0s = dt0s.numpy()
-dt1s = dt1s.numpy()
-dtps = dtps.numpy()
-df0s = df0s.numpy()
-df1s = df1s.numpy()
-dfps = dfps.numpy()
+masses = tf.Variable(np.linspace(100, 500, num=17, endpoint=True))
+dts = transform.get_dt(masses).numpy()
+dfs = transform.get_df(masses).numpy()
+masses = masses.numpy()
 
 plt.figure(figsize=(8, 6))
 for i in range(args.shift_num):
-    dts = dt0s[i] + dt1s[i] * (masses ** dtps[i])
-    dfs = df0s[i] + df1s[i] * (masses ** dfps[i])
-    plt.scatter(dts, dfs, c=masses, cmap="cool")
+    plt.scatter(dts[:, i], dfs[:, i], c=masses, cmap="cool")
 plt.grid()
 plt.colorbar()
 plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts.png')
