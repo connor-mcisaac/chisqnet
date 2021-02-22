@@ -1,3 +1,5 @@
+#!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
+
 import os
 import numpy as np
 import argparse
@@ -134,10 +136,15 @@ for i in range(args.batch_num):
         chi_orthos =  transform.get_ortho(chi_temps, temp, psd)
         logging.info("Orthogonal templates created")
 
-        snr = match(data, psd, temp)
-        chis = match(data, psd, chi_orthos)
-        snr = tf.math.abs(snr)
-        chis = tf.math.abs(chis)
+        temp = tf.expand_dims(temp, axis=1)
+        temps = tf.concat([temp, chi_orthos], axis=1)
+        
+        snrs = match(temps, data, psd)
+        snrs = tf.math.abs(snrs)
+        
+        snr = snrs[:, 0, :]
+        chis = snrs[:, 1:, :]
+
         logging.info("SNRs calculated")
 
         chisq = tf.math.reduce_sum(chis ** 2., axis=1) / 2. / args.shift_num
