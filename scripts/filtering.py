@@ -8,6 +8,16 @@ def real_to_complex(real):
     return tf.complex(real, imag)
 
 
+def add_temp_axis(func):
+    def _add_temp_axis(obj, *args):
+        new_args = []
+        for arg in args:
+            if tf.rank(arg) == 2:
+                arg = tf.expand_dims(arg, axis=1)
+            new_args.append(arg)
+        return func(obj, *new_args)
+    return _add_temp_axis
+
 class BaseFilter(object):
 
     def __init__(self, freqs, f_low, f_high):
@@ -31,16 +41,7 @@ class BaseFilter(object):
 
         self.times = tf.range(self.full_length, delta=1., dtype=tf.float64) * self.delta_t
 
-    def add_axis(self, x, axis, length):
-        x = tf.expand_dims(x, axis=axis)
-        x = tf.repeat(x, length, axis=axis)
-        return x
-
     def cut(self, x):
-        if tf.shape(x)[-1] != self.length:
-            raise ValueError("This function should only be used on a tensor"
-                             + " with last dim length " + str(self.length)
-                             + ", x has length " + str(tf.shape(x)[-1]))
         return x[..., self.kmin:self.kmax]
 
     def pad(self, x, full=False):
@@ -49,18 +50,14 @@ class BaseFilter(object):
         else:
             length = self.length
         shape = tf.shape(x)
-        if shape[-1] != self.cut_length:
-            raise ValueError("This function should only be used on a tensor"
-                             + " with last dim length " + str(self.cut_length)
-                             + ", x has length " + str(tf.shape(x)[-1]))
-        left_shape = tf.concat([shape[:-1], tf.constant([self.kmin])], axis=-1)
+        left_shape = tf.concat([shape[:-1], tf.constant([self.kmin])], axis=0)
         left_pad = tf.zeros(left_shape, dtype=tf.complex128)
         if length == self.kmax:
-            x = tf.concat([left_pad, x], axis=-1)
+            x = tf.concat([left_pad, x], axis=2)
         else:
-            right_shape = tf.concat([shape[:-1], tf.constant([length - self.kmax])], axis=-1)
+            right_shape = tf.concat([shape[:-1], tf.constant([length - self.kmax])], axis=0)
             right_pad = tf.zeros(right_shape, dtype=tf.complex128)
-            x = tf.concat([left_pad, x, right_pad], axis=-1)        
+            x = tf.concat([left_pad, x, right_pad], axis=2)
         return x
 
     def inner(self, a, b, psd):
@@ -70,9 +67,9 @@ class BaseFilter(object):
         return inner
 
     def inner_to_sigma(self, inner):
-        cplx = tf.math.reduce_sum(inner, axis=-1, keepdims=True)
+        cplx = tf.math.reduce_sum(inner, axis=2, keepdims=True)
         sigma = real_to_complex(tf.math.real(cplx) ** 0.5)
-        return tf.repeat(sigma, tf.shape(inner)[-1], axis=-1)
+        return sigma
 
     def sigma(self, x, psd):
         inner = self.inner(x, x, psd)
@@ -81,12 +78,9 @@ class BaseFilter(object):
 
 class MatchedFilter(BaseFilter):
 
-    def __call__(self, data, psd, temp):
-
-        if tf.rank(temp) == 3:
-            ntemp = tf.shape(temp)[1]
-            data = self.add_axis(data, 1, ntemp)
-            psd = self.add_axis(psd, 1, ntemp)
+    @tf.function
+    @add_temp_axis
+    def __call__(self, temp, data, psd):
 
         data = self.cut(data)
         psd = self.cut(psd)
@@ -101,16 +95,13 @@ class MatchedFilter(BaseFilter):
 
 class BaseTransform(BaseFilter):
 
+    @tf.function
+    @add_temp_axis
     def get_ortho(self, temp, base, psd):
         
-        ntemp = tf.shape(temp)[1]
-
         temp = self.cut(temp)
         base = self.cut(base)
         psd = self.cut(psd)
-
-        base = self.add_axis(base, 1, ntemp)
-        psd = self.add_axis(psd, 1, ntemp)
 
         temp_sigma = self.sigma(temp, psd)
         base_sigma = self.sigma(base, psd)
@@ -119,8 +110,7 @@ class BaseTransform(BaseFilter):
         base_norm = base / base_sigma
 
         inner = self.inner(base_norm, temp_norm, psd)
-        overlap = tf.math.reduce_sum(inner, axis=-1, keepdims=True)
-        overlap = tf.repeat(overlap, self.cut_length, axis=-1)
+        overlap = tf.math.reduce_sum(inner, axis=2, keepdims=True)
 
         ortho = ((temp_norm - overlap * base_norm)
                  / (1 - overlap * tf.math.conj(overlap)) ** 0.5)
@@ -170,60 +160,57 @@ class ShiftTransform(BaseTransform):
         z = x * y
         def grad(upstream):
             dz_dx = 1. / y
-            return dz_dx * upstream, None
-        return z, grad            
+            dz_dl = dz_dx * upstream
+            return tf.reduce_mean(dz_dl, axis=0), None
+        return z, grad
 
     def get_dt(self, param):
-        batch = tf.shape(param)[0]
-        dts = self.add_axis(self.dts, 0, batch)
+        dts = tf.expand_dims(self.dts, 0)
 
-        param = self.add_axis(param, 1, self.nshifts)
-        param = self.add_axis(param, 2, self.degree + 1)
-        
+        param = tf.expand_dims(param, 1)
+        param = tf.expand_dims(param, 2)
+
         power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float64)
-        power = self.add_axis(power, 0, batch)
-        power = self.add_axis(power, 1, self.nshifts)
+        power = tf.expand_dims(power, 0)
+        power = tf.expand_dims(power, 1)
         
         params = tf.math.pow(param, power)
 
-        terms = self.mul_grad(dts, params)
-        dt = tf.math.reduce_sum(terms, axis=-1)
+        terms = self.mul_grad(self.dts, params)
+        dt = tf.math.reduce_sum(terms, axis=2)
 
         return dt
 
     def get_df(self, param):
-        batch = tf.shape(param)[0]
-        dfs = self.add_axis(self.dfs, 0, batch)
+        dfs = tf.expand_dims(self.dfs, 0)
 
-        param = self.add_axis(param, 1, self.nshifts)
-        param = self.add_axis(param, 2, self.degree + 1)
+        param = tf.expand_dims(param, 1)
+        param = tf.expand_dims(param, 2)
         
         power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float64)
-        power = self.add_axis(power, 0, batch)
-        power = self.add_axis(power, 1, self.nshifts)
+        power = tf.expand_dims(power, 0)
+        power = tf.expand_dims(power, 1)
         
         params = tf.math.pow(param, power)
 
-        terms = self.mul_grad(dfs, params)
-        df = tf.math.reduce_sum(terms, axis=-1)
+        terms = self.mul_grad(self.dfs, params)
+        df = tf.math.reduce_sum(terms, axis=2)
 
         return df
 
     def shift_dt(self, temp, param):
 
         dt = self.get_dt(param)
-        dt = self.add_axis(dt, 2, self.length)
+        dt = tf.expand_dims(dt, 2)
 
-        batch = tf.shape(temp)[0]
-
-        freqs = self.add_axis(self.freqs, 0, batch)
-        freqs = self.add_axis(freqs, 1, self.nshifts)
+        freqs = tf.expand_dims(self.freqs, 0)
+        freqs = tf.expand_dims(freqs, 1)
 
         shifter = tf.complex(tf.math.cos(- 2. * np.pi * freqs * dt),
                              tf.math.sin(- 2. * np.pi * freqs * dt))
 
         if tf.rank(temp) == 2:
-            temp = self.add_axis(temp, 1, self.nshifts)
+            temp = tf.expand_dims(temp, 1)
         
         return temp * shifter
 
@@ -232,21 +219,18 @@ class ShiftTransform(BaseTransform):
         df = self.get_df(param)
         mod = tf.math.floormod(df, self.delta_f)
         df = df - tf.stop_gradient(mod)
-        df = self.add_axis(df, 2, self.full_length)
-
-        shape = tf.shape(temp)
-        batch = shape[0]
+        df = tf.expand_dims(df, 2)
 
         temp = tf.signal.irfft(temp * self.full_length)
 
-        times = self.add_axis(self.times, 0, batch)
-        times = self.add_axis(times, 1, self.nshifts)
+        times = tf.expand_dims(self.times, 0)
+        times = tf.expand_dims(times, 1)
 
         shifter = tf.complex(tf.math.cos(2. * np.pi * df * times),
                              tf.math.sin(2. * np.pi * df * times))
 
         if tf.rank(temp) == 2:
-            temp = self.add_axis(temp, 1, self.nshifts)
+            temp = tf.expand_dims(temp, 1)
 
         temp = real_to_complex(temp)
         temp = temp * shifter
@@ -255,8 +239,8 @@ class ShiftTransform(BaseTransform):
         temp = temp[..., :self.length]
         df = df[..., :self.length]
 
-        freqs = self.add_axis(self.freqs, 0, batch)
-        freqs = self.add_axis(freqs, 1, self.nshifts)
+        freqs = tf.expand_dims(self.freqs, 0)
+        freqs = tf.expand_dims(freqs, 1)
 
         low = freqs - self.delta_f / 2. - df
         low = low / tf.math.abs(low)
@@ -270,6 +254,7 @@ class ShiftTransform(BaseTransform):
 
         return temp * low * high
 
+    @tf.function
     def shift_dt_df(self, temp, param):
         temp = self.shift_df(temp, param)
         temp = self.shift_dt(temp, param)
