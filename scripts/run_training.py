@@ -5,7 +5,7 @@ import numpy as np
 import argparse
 import logging
 from preprocessing import TriggerList, InjectionTriggers, StrainGen, TemplateGen, BatchGen
-from filtering import MatchedFilter, ShiftTransform
+from filtering import MatchedFilter, ShiftTransform, Convolution1DTransform
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
@@ -101,14 +101,14 @@ batch = BatchGen(gens, triggers, injections, templates, args.batch_size,
 
 match = MatchedFilter(freqs, 15., f_high)
 
-transform = ShiftTransform(args.shift_num, 2, 1e-2, 1e1, 500,
-                           freqs, 15., f_high)
-
-trainables = [transform.dts, transform.dfs]
+#transform = ShiftTransform(args.shift_num, 2, 1e-2, 1e1, 500,
+#                           freqs, 15., f_high)
+transform = Convolution1DTransform(args.shift_num, 15., 0.01,
+                                   freqs, 15., f_high)
 
 chi2 = tfp.distributions.Chi2(tf.constant(1., dtype=tf.float64))
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=1e-8)
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
 
 for i in range(args.batch_num):
     logging.info("Starting batch {0}".format(i))
@@ -127,11 +127,8 @@ for i in range(args.batch_num):
 
     with tf.GradientTape() as tape:
 
-        dts = transform.get_dt(mass)
-        dfs = transform.get_df(mass)
-
-        chi_temps = transform.shift_dt_df(temp, mass)
-        logging.info("Templates shifted")
+        chi_temps = transform.transform(temp, mass)
+        logging.info("Templates transformed")
 
         chi_orthos =  transform.get_ortho(chi_temps, temp, psd)
         logging.info("Orthogonal templates created")
@@ -189,10 +186,10 @@ for i in range(args.batch_num):
 
         logging.info("Loss calculated")
 
-    gradients = tape.gradient(loss, trainables)
+    gradients = tape.gradient(loss, transform.trainable_weights)
     gradients = [tf.where(tf.math.is_nan(grad), tf.zeros_like(grad), grad)
                  for grad in gradients]
-    optimizer.apply_gradients(zip(gradients, trainables))
+    optimizer.apply_gradients(zip(gradients, transform.trainable_weights))
 
     logging.info("Gradients applied")
     logging.info("Completed batch {0}".format(i))

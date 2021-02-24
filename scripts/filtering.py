@@ -155,6 +155,8 @@ class ShiftTransform(BaseTransform):
         self.dfs = tf.Variable(dfs, trainable=True, dtype=tf.float64,
                                constraint=create_constraint(df_lims))
 
+        self.trainable_weights = [self.dts, self.dfs]
+
     @tf.custom_gradient
     def mul_grad(self, x, y):
         z = x * y
@@ -255,7 +257,77 @@ class ShiftTransform(BaseTransform):
         return temp * low * high
 
     @tf.function
-    def shift_dt_df(self, temp, param):
+    def transform(self, temp, param):
         temp = self.shift_df(temp, param)
         temp = self.shift_dt(temp, param)
+        return temp
+
+
+class Convolution1DTransform(BaseTransform):
+
+    def __init__(self, nkernel, max_df, max_dt, freqs, f_low, f_high):
+        
+        super().__init__(freqs, f_low, f_high)
+
+        self.half_width = int(np.ceil(max_df / self.delta_f))
+
+        def normalise(x):
+            x = tf.maximum(x, tf.zeros_like(x))
+            return x / (tf.math.reduce_sum(x) + 1e-7)
+
+        kernels = np.random.randn(self.half_width * 2 + 1, 1, nkernel)
+        kernels = kernels ** 2. / (np.sum(kernels ** 2.) + 1e-7)
+        self.kernels = tf.Variable(kernels, dtype=tf.float64, trainable=True, constraint=normalise)
+
+        def clip(x):
+            x = tf.clip_by_value(x, - max_df, max_dt)
+            return x
+
+        dts = np.random.rand(nkernel) * 2. * max_df - max_df
+        self.dts = tf.Variable(dts, dtype=tf.float64, trainable=True, constraint=clip)
+
+        self.trainable_weights = [self.kernels, self.dts]
+
+    def shift_dt(self, temp):
+
+        dt = tf.expand_dims(self.dts, 0)
+        dt = tf.expand_dims(dt, 2)
+
+        freqs = tf.expand_dims(self.freqs, 0)
+        freqs = tf.expand_dims(freqs, 1)
+
+        shifter = tf.complex(tf.math.cos(- 2. * np.pi * freqs * dt),
+                             tf.math.sin(- 2. * np.pi * freqs * dt))
+
+        if tf.rank(temp) == 2:
+            temp = tf.expand_dims(temp, 1)
+        
+        return temp * shifter
+
+    def convolve(self, temp):
+
+        temp = tf.expand_dims(temp, 1)
+
+        shape = tf.shape(temp)
+        pad_shape = tf.concat([shape[:-1], tf.constant([self.half_width])], axis=0)
+        pad = tf.zeros(pad_shape, dtype=tf.complex128)
+        temp = tf.concat([pad, temp, pad], axis=2)
+
+        temp = tf.transpose(temp, perm=[0, 2, 1])
+
+        temp_real = tf.math.real(temp)
+        temp_imag = tf.math.imag(temp)
+
+        temp_real = tf.nn.conv1d(temp_real, self.kernels, 1, 'VALID', data_format='NWC')
+        temp_imag = tf.nn.conv1d(temp_imag, self.kernels, 1, 'VALID', data_format='NWC')
+
+        temp = tf.complex(temp_real, temp_imag)
+        temp = tf.transpose(temp, perm=[0, 2, 1])
+
+        return temp
+
+    @tf.function
+    def transform(self, temp, param):
+        temp = self.convolve(temp)
+        temp = self.shift_dt(temp)
         return temp
