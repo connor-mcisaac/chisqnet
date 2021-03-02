@@ -1,7 +1,7 @@
 import h5py
 import numpy as np
-from pycbc.events.ranking import newsnr_sgveto
-from pycbc.events.eventmgr import findchirp_cluster_over_window
+from pycbc.events.ranking import newsnr_sgveto, newsnr
+from pycbc.events.coinc import cluster_over_time
 from pycbc.events import veto
 from pycbc.detector import Detector
 from ligo.segments import segment, segmentlist
@@ -9,7 +9,6 @@ from pycbc.frame import frame_paths, read_frame
 from pycbc.filter import resample_to_delta_t
 from pycbc.psd import interpolate, inverse_spectrum_truncation
 from pycbc.waveform import get_fd_waveform, apply_fseries_time_shift
-import glob
 
 
 _trigger_params = ['snr', 'chisq', 'chisq_dof', 'sg_chisq', 'end_time', 'template_id']
@@ -29,6 +28,7 @@ _inj_in_dtypes = ['f8', 'f8', 'f8', 'f8', 'f8', 'f8', 'f8', 'f8', 'f8', 'f8', 'f
 _inj_ex_params = ['end_time', 'latitude', 'longitude', 'polarization']
 _inj_ex_dtypes = ['f8', 'f8', 'f8', 'f8']
 
+_sim_to_hdf = {'latitude': 'dec', 'longitude': 'ra', 'end_time': 'tc'}
 
 def add_params(record, updates, names, dtypes):
     dt = [(n, d) for n, d in zip(names, dtypes)]
@@ -44,11 +44,10 @@ class TriggerList(object):
 
     def __init__(self, trigger_files):
         
-        self._params = _trigger_params[:]
-        self._dtypes = _trigger_dtypes[:]
+        self._params = _trigger_params[:] + ['injection']
+        self._dtypes = _trigger_dtypes[:] + ['?']
         self.triggers = {}
         self.nums = {}
-        self.newsnr = False
         
         for trigger_file in trigger_files:
 
@@ -62,8 +61,9 @@ class TriggerList(object):
                 num = len(f[ifo][self._params[0]][:])
                 record = np.zeros(num, dtype={'names': self._params, 'formats': self._dtypes})
 
-                for p in self._params:
+                for p in _trigger_params:
                     record[p] = f[ifo][p][:]
+                record['injection'] = np.array([False] * num, dtype=bool)
 
                 self.triggers[ifo].append(record)
                 self.nums[ifo] += num
@@ -72,21 +72,55 @@ class TriggerList(object):
 
         for ifo in self.ifos:
             self.triggers[ifo] = np.concatenate(self.triggers[ifo])
-        
 
     def get_newsnr(self):
-        if not self.newsnr:
-            for ifo in self.ifos:
-                self.triggers[ifo]['chisq'] = (self.triggers[ifo]['chisq']
-                                               / (self.triggers[ifo]['chisq_dof'] * 2. - 2))
-        
-                newsnr_sg = newsnr_sgveto(self.triggers[ifo]['snr'],
-                                          self.triggers[ifo]['chisq'],
-                                          self.triggers[ifo]['sg_chisq'])
+        for ifo in self.ifos:
+            updates = []
+            names = []
+            dtypes = []
+            if 'rchisq' not in self.triggers[ifo].dtype.names:
+                rchisq = (self.triggers[ifo]['chisq']
+                          / (self.triggers[ifo]['chisq_dof'] * 2. - 2))
+                updates.append(rchisq)
+                names.append('rchisq')
+                dtypes.append('f8')
+            else:
+                rchisq = self.triggers[ifo]['rchisq']
+                
+            if 'newsnr' not in self.triggers[ifo].dtype.names:
+                nsnr = newsnr(self.triggers[ifo]['snr'], rchisq)
+                updates.append(nsnr)
+                names.append('newsnr')
+                dtypes.append('f8')
 
-                self.triggers[ifo] = add_params(self.triggers[ifo], [newsnr_sg],
-                                                ['newsnr_sg'], ['f8'])
-            self.newsnr = True
+            if len(updates) > 0:
+                self.triggers[ifo] = add_params(self.triggers[ifo], updates,
+                                                names, dtypes)
+
+    def get_newsnr_sg(self):
+        for ifo in self.ifos:
+            updates = []
+            names = []
+            dtypes = []
+            if 'rchisq' not in self.triggers[ifo].dtype.names:
+                rchisq = (self.triggers[ifo]['chisq']
+                          / (self.triggers[ifo]['chisq_dof'] * 2. - 2))
+                updates.append(rchisq)
+                names.append('rchisq')
+                dtypes.append('f8')
+            else:
+                rchisq = self.triggers[ifo]['rchisq']
+                
+            if 'newsnr_sg' not in self.triggers[ifo].dtype.names:
+                newsnr_sg = newsnr_sgveto(self.triggers[ifo]['snr'], rchisq,
+                                          self.triggers[ifo]['sg_chisq'])
+                updates.append(newsnr_sg)
+                names.append('newsnr_sg')
+                dtypes.append('f8')
+
+            if len(updates) > 0:
+                self.triggers[ifo] = add_params(self.triggers[ifo], updates,
+                                                names, dtypes)
 
     def threshold_cut(self, thresh, param):
         
@@ -98,9 +132,9 @@ class TriggerList(object):
     def cluster_over_time(self, window, param):
 
         for ifo in self.ifos:
-            idxs = findchirp_cluster_over_window(self.triggers[ifo]['end_time'],
-                                                 self.triggers[ifo][param],
-                                                 window)
+            idxs = cluster_over_time(self.triggers[ifo][param],
+                                     self.triggers[ifo]['end_time'],
+                                     window)
             self.triggers[ifo] = self.triggers[ifo][idxs]
             self.nums[ifo] = len(idxs)
 
@@ -151,7 +185,7 @@ class TriggerList(object):
 
     def apply_segments(self, seg_files, seg_name, within=True):
         for ifo in self.ifos:
-            times = self.triggers[ifo]['end_time'][:]
+            times = self.triggers[ifo]['end_time']
             if within:
                 idx, segs = veto.indices_within_segments(times, seg_files,
                                                          segment_name=seg_name, ifo=ifo)
@@ -160,6 +194,19 @@ class TriggerList(object):
                                                           segment_name=seg_name, ifo=ifo)
             self.triggers[ifo] = self.triggers[ifo][idx]
             self.nums[ifo] = len(idx)
+
+    def veto_times(self, times, window):
+        for ifo in self.ifos:
+            if isinstance(times, dict):
+                time = times[ifo]
+            else:
+                time = times
+            starts = time - window
+            ends = time + window
+            
+            idxs = veto.indices_outside_times(self.triggers[ifo]['end_time'], starts, ends)
+            self.triggers[ifo] = self.triggers[ifo][idxs]
+            self.nums[ifo] = len(idxs)
 
     def get_time_cut(self, ifo, start, end):
         lgc = self.triggers[ifo]['end_time'] >= start
@@ -178,7 +225,6 @@ class TriggerList(object):
                     _ = i.create_dataset(p, data=data)
             f.attrs['params'] = self._params
             f.attrs['dtypes'] = self._dtypes
-            f.attrs['newsnr'] = self.newsnr
 
     @classmethod
     def read_from_hdf(cls, fp):
@@ -189,7 +235,6 @@ class TriggerList(object):
             ob._params = f.attrs['params']
             ob._dtypes = f.attrs['dtypes']
             ob.ifos = list(f.keys())
-            ob.newsnr = f.attrs['newsnr']
             for ifo in f.keys():
                 num = None
                 for p, d in zip(ob._params, ob._dtypes):
@@ -205,12 +250,19 @@ class TriggerList(object):
                 ob.nums[ifo] = num
         return ob
 
+    def append(self, triggers):
+        for ifo in self.ifos:
+            if ifo not in triggers.triggers.keys():
+                continue
+            common = [p for p in self._params if p in triggers._params]
+            self.triggers[ifo] = np.concatenate([self.triggers[ifo][common],
+                                                 triggers.triggers[ifo][common]])
+            self.nums[ifo] = len(self.triggers[ifo])
+
 
 class InjectionTriggers(TriggerList):
     
-    def __init__(self, inj_dirs, approximants,
-                 find_re="*-HDFINJFIND_*_INJ_INJECTIONS-*-*.hdf",
-                 trig_re="?1-HDF_TRIGGER_MERGE_*_INJ_INJECTIONS-*-*.hdf"):
+    def __init__(self, inj_finds, inj_trigs, approximants, f_lowers=None):
 
         self._inj_params = _inj_in_params[:] + _inj_ex_params[:]
         self._inj_dtypes = _inj_in_dtypes[:] + _inj_ex_dtypes[:]
@@ -218,17 +270,19 @@ class InjectionTriggers(TriggerList):
         self._trig_params = _trigger_params[:]
         self._trig_dtypes = _trigger_dtypes[:]
 
-        self._params = ['inj:' + p for p in self._inj_params + ['approximant']] + self._trig_params
-        self._dtypes = self._inj_dtypes + ['U16'] + self._trig_dtypes
+        self._params = ['inj:' + p for p in self._inj_params + ['approximant', 'f_lower']]
+        self._params += self._trig_params + ['injection', 'injection_index']
+        self._dtypes = self._inj_dtypes + ['U16', 'f8'] + self._trig_dtypes + ['?', 'i4']
 
         self.triggers = {}
         self.nums = {}
-        self.newsnr = False
 
-        for inj_dir, approx in zip(inj_dirs, approximants):
+        if f_lowers is None:
+            f_lowers = [10.] * len(inj_finds)
 
-            inj_find = glob.glob(inj_dir + '/' + find_re)[0]
-            inj_trigs = glob.glob(inj_dir + '/' + trig_re)
+        for inj_find, inj_trig, approx, f_lower in zip(inj_finds, inj_trigs, approximants, f_lowers):
+
+            inj_trigs = inj_trig.split(',')
             inj_trigs = {trig.split('/')[-1][:2]: trig for trig in inj_trigs}
 
             trig_ids = {}
@@ -256,8 +310,11 @@ class InjectionTriggers(TriggerList):
 
                     for p in self._inj_params:
                         record['inj:' + p] = f['injections/' + p][inj_id]
+                        record['injection'] = np.array([True] * num, dtype=bool)
 
                     record['inj:approximant'] = np.array([approx] * num, dtype='U16')
+                    record['inj:f_lower'] = np.array([f_lower] * num, dtype='f8')
+                    record['injection_index'] = inj_id
 
                     records[ifo] = record
 
@@ -290,7 +347,29 @@ class InjectionTriggers(TriggerList):
             ob._trig_params = f.attrs['trig_params']
             ob._trig_dtypes = f.attrs['trig_dtypes']
         return ob
-        
+
+    def write_injection_set(self, fp, **kwargs):
+
+        with h5py.File(fp, 'w') as f:
+            f.attrs['injtype'] = 'cbc'
+            for ifo in self.ifos:
+                g = f.create_group(ifo)
+                g.attrs["static_args"] = list(kwargs.keys())
+                for k, v in kwargs.items():
+                    if isinstance(v, bytes):
+                        g.attrs[k] = str(v)
+                    else:
+                        g.attrs[k] = v
+                for p in self._inj_params:
+                    if p in _sim_to_hdf.keys():
+                        n = _sim_to_hdf[p]
+                    else:
+                        n = p
+                    if self.triggers[ifo]['inj:' + p].dtype.char == 'U':
+                        g[n] = self.triggers[ifo]['inj:' + p].astype('S')
+                    else:
+                        g[n] = self.triggers[ifo]['inj:' + p]
+
 
 def gather_segments(seg_files, seg_name, ifo):
     segs = segmentlist([])
@@ -436,11 +515,23 @@ class BatchGen(object):
         self.snr_width = snr_width
 
     def get_set(self, max_size):
-        base = self.triggers.draw_triggers()
-        ifo = base['ifo'][0]
-        time = base['end_time'][0]
-        
-        strain = self.ifos[ifo].get_strain(time)
+
+        while True:
+            if np.random.choice([True, False]):
+                base = self.triggers.draw_triggers()
+            else:
+                base = self.injections.draw_triggers()
+
+            ifo = base['ifo'][0]
+            time = base['end_time'][0]
+            
+            try:
+                strain = self.ifos[ifo].get_strain(time)
+            except ValueError:
+                continue
+            else:
+                break
+
         psd = self.ifos[ifo].get_psd().numpy()
 
         start = self.ifos[ifo].times[0]
@@ -479,8 +570,8 @@ class BatchGen(object):
 
             params.append(trig[_trigger_params + _bank_params])
             
-            times = strain.sample_times
-            left = np.argmax(times > (trig['end_time'] - self.snr_width / 2.))
+            ts = strain.sample_times
+            left = np.argmax(ts > (trig['end_time'] - self.snr_width / 2.))
             right = left + int(self.snr_width * self.ifos[ifo].sample_rate)
             cut_idxs.append(np.array([left, right]))
 
@@ -509,6 +600,10 @@ class BatchGen(object):
         templates = np.stack(templates)
         params = np.stack(params)
         labels = np.array(labels)
-        cut_idxs = np.stack(cut_idxs)
+        gather_idxs = np.zeros((self.batchsize, cut_idxs[0][1] - cut_idxs[0][0], 2), dtype=int)
+        for i, idxs in enumerate(cut_idxs):
+            gather_idxs[i, :, 0] = i
+            gather_idxs[i, :, 1] = np.arange(idxs[0], idxs[1])
 
-        return stildes, psds, templates, params, labels, cut_idxs
+        return stildes, psds, templates, params, labels, gather_idxs
+
