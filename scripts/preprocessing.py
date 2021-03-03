@@ -30,6 +30,7 @@ _inj_ex_dtypes = ['f8', 'f8', 'f8', 'f8']
 
 _sim_to_hdf = {'latitude': 'dec', 'longitude': 'ra', 'end_time': 'tc'}
 
+
 def add_params(record, updates, names, dtypes):
     dt = [(n, d) for n, d in zip(names, dtypes)]
     updated = np.zeros(len(record), dtype=record.dtype.descr + dt)
