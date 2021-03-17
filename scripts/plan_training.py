@@ -6,13 +6,8 @@ import logging
 import h5py
 import numpy as np
 from ligo.segments import segment, segmentlist, segmentlistdict
-from glue import lal
-from glue.ligolw import ligolw
-from glue.ligolw import utils as ligolw_utils
-from glue.ligolw.utils import segments as ligolw_segments
-from glue.ligolw.utils import process as ligolw_process
-from pycbc.workflow import SegFile
 from preprocessing import TriggerList, gather_segments
+from strain import segmentlistdict_to_xml
 
 
 class DataCollector(object):
@@ -49,29 +44,6 @@ class AttributeCollector(object):
                 self.attrs[k] = group.attrs[k]
             elif self.attrs[k] != group.attrs[k]:
                 raise ValueError("Groups have different attributes")
-
-
-def segmentlistdict_to_xml(segments, output):
-    outdoc = ligolw.Document()
-    outdoc.appendChild(ligolw.LIGO_LW())
-    process = ligolw_process.register_to_xmldoc(outdoc, sys.argv[0], {})
-
-    valid_segments = segments.extent_all()
-    for key, seglist in segments.items():
-        ifo, name = key.split(':')
-
-        fsegs = [(lal.LIGOTimeGPS(seg[0]),
-                  lal.LIGOTimeGPS(seg[1])) for seg in seglist]
-
-        vsegs = [(lal.LIGOTimeGPS(valid_segments[0]),
-                  lal.LIGOTimeGPS(valid_segments[1]))]
-
-        with ligolw_segments.LigolwSegments(outdoc, process) as x:
-            x.add(ligolw_segments.LigolwSegmentList(active=fsegs,
-                                                    instruments=set([ifo]), name=name,
-                                                    version=1, valid=vsegs))
-
-        ligolw_utils.write_filename(outdoc, output)
 
 
 parser = argparse.ArgumentParser()
