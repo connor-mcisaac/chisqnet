@@ -47,6 +47,23 @@ class SampleFile(object):
         params = self.get_params(param, idxs)
         return np.min(params), np.max(params)
 
+
+def chi2(x, df):
+    term1 = tf.math.log(x) * (0.5 * df - 1)
+    term2 = -0.5 * x
+    term3 = tf.math.lgamma(0.5 * df) + tf.math.log(2.) * (0.5 * df)
+    return term1 + term2 - term3
+
+
+def nc_chi2(x, df, nc):
+    # Implementation copied from scipy.stats.ncx2
+    df2 = df / 2. - 1.
+    xs = tf.math.sqrt(x)
+    ns = tf.math.sqrt(nc)
+    res = tf.math.xlogy(df2 / 2., x / nc) - 0.5 * (xs - ns) ** 2.
+    corr = tfp.math.log_bessel_ive(df2, xs * ns) - tf.math.log(2.)
+    return res + corr
+
 parser = argparse.ArgumentParser()
 
 # Gather inputs from planning step, Injection file is included in strain options group
@@ -142,6 +159,18 @@ transform = ShiftTransform(args.shift_num, args.poly_degree,
                            freqs, samples.flow,
                            samples.sample_rate // 2)
 
+"""
+transform = Convolution1DTransform(args.shift_num,
+                                   args.base_freq_shift,
+                                   args.base_time_shift, freqs,
+                                   samples.flow, samples.sample_rate // 2)
+"""
+
+clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
+threshold = tf.Variable(np.array([2.], dtype=np.float32), trainable=True,
+                        dtype=tf.float32, constraint=clip)
+train = transform.trainable_weights + [threshold]
+
 params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
                      dtype=tf.float32)
 dts = transform.get_dt(params).numpy()
@@ -149,6 +178,7 @@ dfs = transform.get_df(params).numpy()
 params = params.numpy()
 
 plt.figure(figsize=(8, 6))
+plt.title("threshold = {0:.4f}".format(threshold.numpy()[0]), fontsize="large")
 for i in range(args.shift_num):
     plt.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool")
 plt.xlim([-0.02, 0.02])
@@ -161,8 +191,6 @@ cbar.ax.set_ylabel('Total Mass', fontsize='large')
 plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e0.png', bbox='tight')
 plt.close()
 
-chi2 = tfp.distributions.Chi2(tf.constant(1., dtype=tf.float32))
-
 optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
 
 for i in range(args.epochs):
@@ -172,6 +200,13 @@ for i in range(args.epochs):
         np.random.shuffle(order)
 
     nbatches = int(np.ceil(1. * samples.num / args.batch_size))
+
+    losses = 0.
+    times = 0.
+    inj_chis = 0.
+    inj_count = 0
+    trig_snrs = 0.
+    trig_count = 0
 
     for j in range(nbatches):
 
@@ -207,6 +242,7 @@ for i in range(args.epochs):
         with tf.GradientTape() as tape:
 
             chi_temps = transform.transform(temp, param)
+            #chi_temps = transform.transform(temp)
             logging.info("Templates transformed")
 
             chi_orthos, ortho_lgc =  transform.get_ortho(chi_temps, temp, psds)
@@ -233,17 +269,22 @@ for i in range(args.epochs):
 
             logging.info("SNRs calculated")
 
-            chisq = tf.math.reduce_sum(chis ** 2., axis=1) / 2. / tf.stop_gradient(ortho_num)
+            chisq = tf.math.reduce_sum(chis ** 2., axis=1)
+            rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
 
-            chisq_thresh = tf.math.maximum(chisq, tf.ones_like(chisq, dtype=tf.float32))
+            chisq_thresh = rchisq / threshold
+            chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
 
             snr_prime = snr_max / chisq_thresh ** 0.5
 
             logging.info("SNR' calculated")
 
-            snr_logp = - chi2.log_prob(snr_prime)
-            chi_logp = - chi2.log_prob(chisq)
+            trig_loss = - chi2(snr_prime ** 2., 2.)
+            inj_loss = - nc_chi2(snr_prime, 2., snr_max)
+            #trig_loss = snr_prime ** 2.
+            #inj_loss = (snr_max - snr_prime) ** 2.
 
+            """
             num_inj = tf.math.reduce_sum(tf.cast(injs, tf.float32)).numpy()
 
             trig_weight = tf.ones_like(injs, dtype=tf.float32)
@@ -254,36 +295,51 @@ for i in range(args.epochs):
             inj_weight /= tf.maximum(inj_weight, inj_num)
 
             batch_loss = tf.where(injs,
-                                  chi_logp * inj_weight,
-                                  snr_logp * trig_weight)
+                                  inj_loss * inj_weight,
+                                  trig_loss * trig_weight)
+            """
+
+            batch_loss = tf.where(injs, inj_loss, trig_loss)
+
             loss = tf.reduce_mean(batch_loss)
 
             logging.info("Loss calculated")
 
-        gradients = tape.gradient(loss, transform.trainable_weights,
-                                  unconnected_gradients='none')
-        #gradients = [tf.where(tf.math.is_nan(grad), tf.zeros_like(grad), grad)
-        #             for grad in gradients]
+        gradients = tape.gradient(loss, train, unconnected_gradients='none')
         logging.info("Gradients calculated")
 
-        optimizer.apply_gradients(zip(gradients, transform.trainable_weights))
-        #for z in range(len(gradients)):
-        #    transform.trainable_weights[z].assign_sub(args.learning_rate * gradients[z])
-
+        optimizer.apply_gradients(zip(gradients, train))
         logging.info("Gradients applied")
         logging.info("Completed batch")
 
         duration = time.time() - start
-        print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
-              + "Loss: {0:12.6f}, Time: {1:8.2f}".format(loss, duration))
+        losses += loss
+        times += duration
+        inj_lgc = injs.numpy()
+        trig_lgc = np.logical_not(inj_lgc)
+        inj_chis += np.sum(rchisq.numpy()[inj_lgc])
+        inj_count += np.sum(inj_lgc)
+        trig_snrs += np.sum(snr_prime.numpy()[trig_lgc])
+        trig_count += np.sum(trig_lgc)
 
-        params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
-                             dtype=tf.float32)
-        dts = transform.get_dt(params).numpy()
-        dfs = transform.get_df(params).numpy()
-        params = params.numpy()
+        if j == (nbatches - 1):
+            end_str = '\n'
+        else:
+            end_str = '\r'
+        print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
+              + "Av. Loss: {0:6.6f}, Av. Time: {1:6.2f}, ".format(losses / (j + 1), times / (j + 1))
+              + "Av. Inj Chi: {0:6.6f}, ".format(inj_chis / inj_count)
+              + "Av. Trig SNR' : {0:6.6f}".format(trig_snrs / trig_count),
+              end=end_str)
+
+    params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
+                         dtype=tf.float32)
+    dts = transform.get_dt(params).numpy()
+    dfs = transform.get_df(params).numpy()
+    params = params.numpy()
     
     plt.figure(figsize=(8, 6))
+    plt.title("threshold = {0:.4f}".format(threshold.numpy()[0]), fontsize="large")
     for k in range(args.shift_num):
         plt.scatter(dts[:, k], dfs[:, k], c=params, cmap="cool")
     plt.xlim([-0.02, 0.02])
