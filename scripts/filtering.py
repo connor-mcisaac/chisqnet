@@ -335,18 +335,24 @@ class Convolution1DTransform(BaseTransform):
             x = tf.maximum(x, tf.zeros_like(x))
             return x / (tf.math.reduce_sum(x) + 1e-7)
 
-        kernels = np.random.randn(self.half_width * 2 + 1, 1, nkernel)
-        kernels = kernels ** 2. / (np.sum(kernels ** 2.) + 1e-7)
-        self.kernels = tf.Variable(kernels, dtype=tf.float32, trainable=True, constraint=normalise)
+        kernels_real = np.random.randn(self.half_width * 2 + 1, 1, nkernel)
+        kernels_real = kernels_real ** 2. / (np.sum(kernels_real ** 2.) + 1e-7)
+        self.kernels_real = tf.Variable(kernels_real, dtype=tf.float32,
+                                        trainable=True, constraint=normalise)
+
+        kernels_imag = np.random.randn(self.half_width * 2 + 1, 1, nkernel)
+        kernels_imag = kernels_imag ** 2. / (np.sum(kernels_imag ** 2.) + 1e-7)
+        self.kernels_imag = tf.Variable(kernels_imag, dtype=tf.float32,
+                                        trainable=True, constraint=normalise)
 
         def clip(x):
-            x = tf.clip_by_value(x, - max_df, max_dt)
+            x = tf.clip_by_value(x, - max_dt, max_dt)
             return x
 
-        dts = np.random.rand(nkernel) * 2. * max_df - max_df
+        dts = np.random.rand(nkernel) * 2. * max_dt - max_dt
         self.dts = tf.Variable(dts, dtype=tf.float32, trainable=True, constraint=clip)
 
-        self.trainable_weights = [self.kernels, self.dts]
+        self.trainable_weights = [self.kernels_real, self.kernels_imag, self.dts]
 
     def shift_dt(self, temp):
 
@@ -378,16 +384,18 @@ class Convolution1DTransform(BaseTransform):
         temp_real = tf.math.real(temp)
         temp_imag = tf.math.imag(temp)
 
-        temp_real = tf.nn.conv1d(temp_real, self.kernels, 1, 'VALID', data_format='NWC')
-        temp_imag = tf.nn.conv1d(temp_imag, self.kernels, 1, 'VALID', data_format='NWC')
+        ctemp_real = tf.nn.conv1d(temp_real, self.kernels_real, 1, 'VALID', data_format='NWC')
+        ctemp_real -= tf.nn.conv1d(temp_imag, self.kernels_imag, 1, 'VALID', data_format='NWC')
+        ctemp_imag = tf.nn.conv1d(temp_imag, self.kernels_real, 1, 'VALID', data_format='NWC')
+        ctemp_imag += tf.nn.conv1d(temp_real, self.kernels_imag, 1, 'VALID', data_format='NWC')
 
-        temp = tf.complex(temp_real, temp_imag)
-        temp = tf.transpose(temp, perm=[0, 2, 1])
+        ctemp = tf.complex(ctemp_real, ctemp_imag)
+        ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
 
-        return temp
+        return ctemp
 
     @tf.function
-    def transform(self, temp, param):
+    def transform(self, temp):
         temp = self.convolve(temp)
         temp = self.shift_dt(temp)
         return temp
