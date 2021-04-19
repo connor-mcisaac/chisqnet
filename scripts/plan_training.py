@@ -1,49 +1,12 @@
 #!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
 
-import sys
 import argparse
 import logging
 import h5py
 import numpy as np
 from ligo.segments import segment, segmentlist, segmentlistdict
-from preprocessing import TriggerList, gather_segments
+from preprocessing import TriggerList, gather_segments, DataCollector, AttributeCollector
 from strain import segmentlistdict_to_xml
-
-
-class DataCollector(object):
-
-    def __init__(self):
-        self.datasets = {}
-
-    def __call__(self, name, node):
-        if not isinstance(node, h5py.Dataset):
-            pass
-        elif name not in self.datasets.keys():
-            self.datasets[name] = [node[:]]
-        else:
-            self.datasets[name].append(node[:])
-
-    def concatenate_datasets(self):
-        for k, v in self.datasets.items():
-            self.datasets[k] = np.concatenate(v)
-
-    def check_lengths(self):
-        lengths = np.array([len(v) for v in self.datasets.values()])
-        if len(np.unique(lengths)) > 1:
-            raise ValueError("All dtasets do not have the same length")
-
-
-class AttributeCollector(object):
-
-    def __init__(self):
-        self.attrs = {}
-
-    def __call__(self, group):
-        for k in group.attrs.keys():
-            if k not in self.attrs.keys():
-                self.attrs[k] = group.attrs[k]
-            elif self.attrs[k] != group.attrs[k]:
-                raise ValueError("Groups have different attributes")
 
 
 parser = argparse.ArgumentParser()

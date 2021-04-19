@@ -378,3 +378,39 @@ def gather_segments(seg_files, seg_name, ifo):
         segs += veto.select_segments_by_definer(f, seg_name, ifo)
     segs.coalesce()
     return segs
+
+
+class DataCollector(object):
+
+    def __init__(self):
+        self.datasets = {}
+
+    def __call__(self, name, node):
+        if not isinstance(node, h5py.Dataset):
+            pass
+        elif name not in self.datasets.keys():
+            self.datasets[name] = [node[:]]
+        else:
+            self.datasets[name].append(node[:])
+
+    def concatenate_datasets(self):
+        for k, v in self.datasets.items():
+            self.datasets[k] = np.concatenate(v, axis=0)
+
+    def check_lengths(self):
+        lengths = np.array([len(v) for v in self.datasets.values()])
+        if len(np.unique(lengths)) > 1:
+            raise ValueError("All dtasets do not have the same length")
+
+
+class AttributeCollector(object):
+
+    def __init__(self):
+        self.attrs = {}
+
+    def __call__(self, group):
+        for k in group.attrs.keys():
+            if k not in self.attrs.keys():
+                self.attrs[k] = group.attrs[k]
+            elif self.attrs[k] != group.attrs[k]:
+                raise ValueError("Groups have different attributes")
