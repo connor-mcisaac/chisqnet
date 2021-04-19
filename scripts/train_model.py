@@ -167,7 +167,7 @@ transform = Convolution1DTransform(args.shift_num,
 """
 
 clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
-threshold = tf.Variable(np.array([2.], dtype=np.float32), trainable=True,
+threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
                         dtype=tf.float32, constraint=clip)
 train = transform.trainable_weights + [threshold]
 
@@ -188,7 +188,7 @@ plt.ylabel('Frequency Shift (Hz)', fontsize='large')
 plt.grid()
 cbar = plt.colorbar()
 cbar.ax.set_ylabel('Total Mass', fontsize='large')
-plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e0.png', bbox='tight')
+plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e0.png', bbox_inches='tight')
 plt.close()
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
@@ -248,8 +248,9 @@ for i in range(args.epochs):
             chi_orthos, ortho_lgc =  transform.get_ortho(chi_temps, temp, psds)
             logging.info("Orthogonal templates created")
 
-            snr, _ = match.matched_filter(temp, segs, psds)
-            snr = snr[:, 0, :]
+            snrs, _ = match.matched_filter(temp, segs, psds)
+
+            snr = snrs[:, 0, :]
 
             snr_cut = tf.gather_nd(snr, gather_idxs)
             max_snr = tf.math.argmax(snr_cut, axis=-1)
@@ -279,25 +280,11 @@ for i in range(args.epochs):
 
             logging.info("SNR' calculated")
 
-            trig_loss = - chi2(snr_prime ** 2., 2.)
-            inj_loss = - nc_chi2(snr_prime, 2., snr_max)
-            #trig_loss = snr_prime ** 2.
-            #inj_loss = (snr_max - snr_prime) ** 2.
-
-            """
-            num_inj = tf.math.reduce_sum(tf.cast(injs, tf.float32)).numpy()
-
-            trig_weight = tf.ones_like(injs, dtype=tf.float32)
-            trig_weight /= (len(idxs) - num_inj)
-
-            inj_weight = tf.ones_like(injs, dtype=tf.float32)
-            inj_num = tf.ones_like(injs, dtype=tf.float32) * num_inj
-            inj_weight /= tf.maximum(inj_weight, inj_num)
-
-            batch_loss = tf.where(injs,
-                                  inj_loss * inj_weight,
-                                  trig_loss * trig_weight)
-            """
+            #trig_loss = - chi2(snr_prime ** 2., 2.)
+            #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
+            above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
+            trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
+            inj_loss = chisq_thresh ** 0.5
 
             batch_loss = tf.where(injs, inj_loss, trig_loss)
 
@@ -317,9 +304,9 @@ for i in range(args.epochs):
         times += duration
         inj_lgc = injs.numpy()
         trig_lgc = np.logical_not(inj_lgc)
-        inj_chis += np.sum(rchisq.numpy()[inj_lgc])
+        inj_chis += np.sum(inj_loss.numpy()[inj_lgc])
         inj_count += np.sum(inj_lgc)
-        trig_snrs += np.sum(snr_prime.numpy()[trig_lgc])
+        trig_snrs += np.sum(trig_loss.numpy()[trig_lgc])
         trig_count += np.sum(trig_lgc)
 
         if j == (nbatches - 1):
@@ -328,8 +315,8 @@ for i in range(args.epochs):
             end_str = '\r'
         print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
               + "Av. Loss: {0:6.6f}, Av. Time: {1:6.2f}, ".format(losses / (j + 1), times / (j + 1))
-              + "Av. Inj Chi: {0:6.6f}, ".format(inj_chis / inj_count)
-              + "Av. Trig SNR' : {0:6.6f}".format(trig_snrs / trig_count),
+              + "Av. Inj SNR Div: {0:6.6f}, ".format(inj_chis / inj_count)
+              + "Av. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count),
               end=end_str)
 
     params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
@@ -349,6 +336,7 @@ for i in range(args.epochs):
     plt.grid()
     cbar = plt.colorbar()
     cbar.ax.set_ylabel('Total Mass', fontsize='large')
-    plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e{0}.png'.format(i + 1), bbox='tight')
+    plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e{0}.png'.format(i + 1),
+                bbox_inches='tight')
     plt.close()
 
