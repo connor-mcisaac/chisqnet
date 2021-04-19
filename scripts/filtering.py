@@ -166,7 +166,7 @@ class BaseTransform(BaseFilter):
 class ShiftTransform(BaseTransform):
 
     def __init__(self, nshifts, degree, dt, df, param_max,
-                 freqs, f_low, f_high):
+                 freqs, f_low, f_high, offset=None):
 
         super().__init__(freqs, f_low, f_high)
 
@@ -178,23 +178,17 @@ class ShiftTransform(BaseTransform):
         self.dt = dt
         self.df = df
         self.param_max = param_max
+        
+        if offset is None:
+            offset = np.pi / nshifts
 
-        offset = np.pi / nshifts
         dt_base = np.stack([1. * np.sin(2. * np.pi * np.arange(nshifts) / nshifts + offset)
                             for i in range(degree + 1)], axis=-1)
         df_base = np.stack([1. * np.cos(2. * np.pi * np.arange(nshifts) / nshifts + offset)
                             for i in range(degree + 1)], axis=-1)
 
-        def create_constraint(max_value):
-            def constraint(x):
-                x = tf.clip_by_value(x, - 1. * max_value, max_value)
-                return x
-            return constraint
-
-        self.dt_base = tf.Variable(dt_base, trainable=True, dtype=tf.float32,
-                                   constraint=create_constraint(1.))
-        self.df_base = tf.Variable(df_base, trainable=True, dtype=tf.float32,
-                                   constraint=create_constraint(1.))
+        self.dt_base = tf.Variable(dt_base, trainable=True, dtype=tf.float32)
+        self.df_base = tf.Variable(df_base, trainable=True, dtype=tf.float32)
 
         self.trainable_weights = [self.dt_base, self.df_base]
 
