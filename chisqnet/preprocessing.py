@@ -400,7 +400,7 @@ class DataCollector(object):
     def check_lengths(self):
         lengths = np.array([len(v) for v in self.datasets.values()])
         if len(np.unique(lengths)) > 1:
-            raise ValueError("All dtasets do not have the same length")
+            raise ValueError("All datasets do not have the same length")
 
 
 class AttributeCollector(object):
