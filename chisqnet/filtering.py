@@ -190,7 +190,7 @@ class ShiftTransform(BaseTransform):
         self.dt_base = tf.Variable(dt_base, trainable=True, dtype=tf.float32)
         self.df_base = tf.Variable(df_base, trainable=True, dtype=tf.float32)
 
-        self.trainable_weights = [self.dt_base, self.df_base]
+        self.trainable_weights = {'dt': self.dt_base, 'df': self.df_base}
 
     def get_dt(self, param):
         dts = tf.expand_dims(self.dt_base, 0)
@@ -346,7 +346,9 @@ class Convolution1DTransform(BaseTransform):
         dts = np.random.rand(nkernel) * 2. * max_dt - max_dt
         self.dts = tf.Variable(dts, dtype=tf.float32, trainable=True, constraint=clip)
 
-        self.trainable_weights = [self.kernels_real, self.kernels_imag, self.dts]
+        self.trainable_weights = {'kernel_real': self.kernels_real,
+                                  'kernel_imag': self.kernels_imag,
+                                  'dt': self.dts}
 
     def shift_dt(self, temp):
 

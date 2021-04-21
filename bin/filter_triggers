@@ -1,8 +1,8 @@
-#!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
+#! /usr/bin/env python
 
 import argparse
 import logging
-from preprocessing import TriggerList, InjectionTriggers
+from chisqnet.preprocessing import TriggerList, InjectionTriggers
 
 
 parser = argparse.ArgumentParser()

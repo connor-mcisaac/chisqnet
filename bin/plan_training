@@ -1,12 +1,12 @@
-#!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
+#! /usr/bin/env python
 
 import argparse
 import logging
 import h5py
 import numpy as np
 from ligo.segments import segment, segmentlist, segmentlistdict
-from preprocessing import TriggerList, gather_segments, DataCollector, AttributeCollector
-from strain import segmentlistdict_to_xml
+from chisqnet.preprocessing import TriggerList, gather_segments, DataCollector, AttributeCollector
+from chisqnet.strain import segmentlistdict_to_xml
 
 
 parser = argparse.ArgumentParser()

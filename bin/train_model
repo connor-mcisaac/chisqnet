@@ -1,4 +1,4 @@
-#!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
+#! /usr/bin/env python
 
 import argparse
 import logging, time
@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 from pycbc import waveform
 from pycbc.types import zeros, float32, complex64
-from filtering import MatchedFilter, ShiftTransform, Convolution1DTransform
+from chisqnet.filtering import MatchedFilter, ShiftTransform
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
@@ -119,6 +119,12 @@ parser.add_argument("--base-freq-shift", default=10., type=float,
 parser.add_argument("--shift-param", default="mtotal", type=str,
                     help="The parameter used to calculate the time and frequency shifts")
 
+# Gather inputs for output
+parser.add_argument("--output-file", required=True,
+                    help="The path of the output file to save the weights and losses")
+parser.add_argument("--checkpoint", type=int,
+                    help="If given save the weights after this many epochs")                    
+
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
 
@@ -159,39 +165,27 @@ transform = ShiftTransform(args.shift_num, args.poly_degree,
                            freqs, samples.flow,
                            samples.sample_rate // 2)
 
-"""
-transform = Convolution1DTransform(args.shift_num,
-                                   args.base_freq_shift,
-                                   args.base_time_shift, freqs,
-                                   samples.flow, samples.sample_rate // 2)
-"""
-
 clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
 threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
                         dtype=tf.float32, constraint=clip)
-train = transform.trainable_weights + [threshold]
 
-params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
-                     dtype=tf.float32)
-dts = transform.get_dt(params).numpy()
-dfs = transform.get_df(params).numpy()
-params = params.numpy()
+train = transform.trainable_weights
+train['thresh'] = threshold
 
-plt.figure(figsize=(8, 6))
-plt.title("threshold = {0:.4f}".format(threshold.numpy()[0]), fontsize="large")
-for i in range(args.shift_num):
-    plt.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool")
-plt.xlim([-0.02, 0.02])
-plt.ylim([-15, 15])
-plt.xlabel('Time Shift (s)', fontsize='large')
-plt.ylabel('Frequency Shift (Hz)', fontsize='large')
-plt.grid()
-cbar = plt.colorbar()
-cbar.ax.set_ylabel('Total Mass', fontsize='large')
-plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e0.png', bbox_inches='tight')
-plt.close()
+trainable_names = [k for k in train.keys()]
+trainable_weights = [train[k] for k in trainable_names]
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+
+out_file = h5py.File(args.output_file, 'w')
+out_file.attrs['shift_num'] = args.shift_num
+out_file.attrs['poly_degree'] = args.poly_degree
+out_file.attrs['base_time_shift'] = args.base_time_shift
+out_file.attrs['base_freq_shift'] = args.base_freq_shift
+
+save_epochs = []
+save_losses = []
+save_checks = {t: [] for t in train.keys()}
 
 for i in range(args.epochs):
 
@@ -292,10 +286,10 @@ for i in range(args.epochs):
 
             logging.info("Loss calculated")
 
-        gradients = tape.gradient(loss, train, unconnected_gradients='none')
+        gradients = tape.gradient(loss, trainable_weights, unconnected_gradients='none')
         logging.info("Gradients calculated")
 
-        optimizer.apply_gradients(zip(gradients, train))
+        optimizer.apply_gradients(zip(gradients, trainable_weights))
         logging.info("Gradients applied")
         logging.info("Completed batch")
 
@@ -315,28 +309,21 @@ for i in range(args.epochs):
             end_str = '\r'
         print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
               + "Av. Loss: {0:6.6f}, Av. Time: {1:6.2f}, ".format(losses / (j + 1), times / (j + 1))
-              + "Av. Inj SNR Div: {0:6.6f}, ".format(inj_chis / inj_count)
+              + "Av. Inj Div: {0:6.6f}, ".format(inj_chis / inj_count)
               + "Av. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count),
               end=end_str)
 
-    params = tf.Variable(np.linspace(min_param, max_param, num=25, endpoint=True),
-                         dtype=tf.float32)
-    dts = transform.get_dt(params).numpy()
-    dfs = transform.get_df(params).numpy()
-    params = params.numpy()
-    
-    plt.figure(figsize=(8, 6))
-    plt.title("threshold = {0:.4f}".format(threshold.numpy()[0]), fontsize="large")
-    for k in range(args.shift_num):
-        plt.scatter(dts[:, k], dfs[:, k], c=params, cmap="cool")
-    plt.xlim([-0.02, 0.02])
-    plt.ylim([-15, 15])
-    plt.xlabel('Time Shift (s)', fontsize='large')
-    plt.ylabel('Frequency Shift (Hz)', fontsize='large')
-    plt.grid()
-    cbar = plt.colorbar()
-    cbar.ax.set_ylabel('Total Mass', fontsize='large')
-    plt.savefig('/home/connor.mcisaac/public_html/imbh/mass_shifts_e{0}.png'.format(i + 1),
-                bbox_inches='tight')
-    plt.close()
+    save_losses += [losses / nbatches]
 
+    if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
+        save_epochs += [i + 1]
+        for k, v in zip(trainable_names, trainable_weights):
+            save_checks[k] += [v.numpy()]
+
+_ = out_file.create_dataset('loss', data=np.array(save_losses))
+
+_ = out_file.create_dataset('epoch', data=np.array(save_epochs))
+for k, v in save_checks.items():
+    _ = out_file.create_dataset(k, data=np.stack(v, axis=0))
+
+out_file.close()

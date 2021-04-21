@@ -1,13 +1,13 @@
-#!/home/connor.mcisaac/envs/tensor-imbh/bin/python3.6
+#! /usr/bin/env python
 
 import argparse
 import logging, time
 import h5py
 import numpy as np
-from preprocessing import TriggerList, add_params
+from chisqnet.preprocessing import TriggerList, add_params
 from pycbc.workflow import SegFile
-from strain import xml_to_segmentlistdict
-from strain import insert_strain_option_group, strain_from_cli, StrainSegmentsCut
+from chisqnet.strain import xml_to_segmentlistdict
+from chisqnet.strain import insert_strain_option_group, strain_from_cli, StrainSegmentsCut
 from pycbc import psd, waveform, DYN_RANGE_FAC
 from pycbc.types import zeros, float32, complex64
 
