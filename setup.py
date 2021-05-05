@@ -25,7 +25,8 @@ setuptools.setup(
              "bin/plan_training",
              "bin/preprocess_strain",
              "bin/merge_samples",
-             "bin/train_model"],
+             "bin/train_model",
+             "bin/make_chisqnet_workflow"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",

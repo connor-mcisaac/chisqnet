@@ -1,0 +1,257 @@
+#!/usr/bin/env python
+
+"""
+Script for creating a workflow to prepare a training set and train a model
+for chi-squared discriminators.
+"""
+
+import os, argparse, logging, glob, sys, socket
+import pycbc.workflow as wf
+from pycbc.results import layout, create_versioning_page
+from pycbc.results.versioning import save_fig_with_metadata
+from ligo import segments
+from six.moves import configparser as ConfigParser
+from chisqnet.workflow import FilterTriggersExecutable, PlanningExecutable, PreprocessStrainExecutable
+from chisqnet.workflow import MergeSamplesExecutable, TrainingExecutable
+
+
+def return_single_filestr(regex):
+    check = glob.glob(regex)
+    if len(check) == 0:
+        raise ValueError("No file found for " + regex)
+    elif len(check) > 1:
+        raise ValueError("Found multiple files for " + regex)
+    return check[0]
+
+
+def return_single_file(regex, ifos='HLV', segs=None, tags=[]):
+    filestr = return_single_filestr(regex)
+    file_attrs = {'ifos': ifos,
+                  'segs': segs,
+                  'tags': tags}
+    pfile = wf.resolve_url_to_file(filestr, attrs=file_attrs)
+    return pfile
+
+
+# Log to the screen until we know where the output file is
+logging.basicConfig(format='%(asctime)s:%(levelname)s : %(message)s',
+    level=logging.INFO)
+
+parser = argparse.ArgumentParser(description=__doc__[1:])
+#parser.add_argument('--version', action='version', version=__version__)
+parser.add_argument('--workflow-name', default='my_unamed_run')
+parser.add_argument("-d", "--output-dir", default=None,
+                    help="Path to output directory.")
+wf.add_workflow_command_line_group(parser)
+args = parser.parse_args()
+
+container = wf.Workflow(args, args.workflow_name)
+workflow = wf.Workflow(args, args.workflow_name + '-main')
+finalize_workflow = wf.Workflow(args, args.workflow_name + '-finalization')
+
+wf.makedir(args.output_dir)
+os.chdir(args.output_dir)
+args.output_dir = '.'
+
+rdir = layout.SectionNumber('results', ['filtered_triggers',
+                                        'training_samples',
+                                        'trained_models',
+                                        'workflow'])
+wf.makedir(rdir.base)
+wf.makedir(rdir['workflow'])
+
+wf_log_file = wf.File(workflow.ifos, 'workflow-log', workflow.analysis_time,
+                      extension='.txt',
+                      directory=rdir['workflow'])
+
+logging.basicConfig(format='%(asctime)s:%(levelname)s : %(message)s',
+                    filename=wf_log_file.storage_path,
+                    level=logging.INFO,
+                    filemode='w')
+
+logfile = logging.FileHandler(filename=wf_log_file.storage_path,mode='w')
+logfile.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s:%(levelname)s : %(message)s')
+logfile.setFormatter(formatter)
+logging.getLogger('').addHandler(logfile)
+logging.info("Created log file %s" % wf_log_file.storage_path)
+
+# Gather input files from config and setup filtering jobs
+logging.info("Setting up trigger filtering")
+filter_job = FilterTriggersExecutable(workflow.cp, 'filter', out_dir='filtered_triggers',
+                                      ifos='HLV', tags=[])
+
+filter_files = wf.FileList([])
+injection_files = wf.FileList([])
+segment_files = wf.FileList([])
+
+for section in workflow.cp.get_subsections('filter'):
+    logging.info("Creating job for {0}".format(section))
+    curr_tags = [section.upper()]
+    search_dir = workflow.cp.get_opt_tags("workflow-filter",
+                                          "search-dir",
+                                          curr_tags)
+    inj_tags = workflow.cp.get_opt_tags("workflow-filter",
+                                        "injection-tags",
+                                        curr_tags).split(" ")
+
+    # Select segment and veto files
+    segment_filestr = return_single_filestr(search_dir + '/results/1._analysis_time/1.01_segment_data/'
+                                            + '*-INSP_SEGMENTS-*-*.xml')
+    segment_file = wf.SegFile.from_segment_xml(segment_filestr)
+    segs = segment_file.segment_list
+    segment_files.append(segment_file)
+
+    veto_file = return_single_file(search_dir + '/segments/*-FOREGROUND_CENSOR-*-*.xml', segs=segs)
+
+    # Select single detector trigger files
+    single_det_files = wf.FileList([])
+    for ifo in workflow.ifos:
+        single_det_file = return_single_file(search_dir + '/full_data/' + ifo.upper()
+                                             + '-HDF_TRIGGER_MERGE_FULL_DATA-*-*.hdf',
+                                             ifos=ifo, tags=curr_tags, segs=segs)
+        single_det_files.append(single_det_file)
+
+    # Select injection files, injection-find and single detector
+    injfind_files = wf.FileList([])
+    inj_single_det_files = []
+
+    for inj_tag in inj_tags:
+        tag = inj_tag.upper()
+        injfind_file = return_single_file(search_dir + '/' + tag + '_INJ_coinc/*-HDFINJFIND_'
+                                          + tag + '_INJ_INJECTIONS-*-*.hdf', tags=curr_tags+[tag],
+                                          segs=segs)
+        injfind_files.append(injfind_file)
+
+        inj_single_det_files.append(wf.FileList([]))
+        for ifo in workflow.ifos:
+            inj_single_det_file = return_single_file(search_dir + '/' + tag + '_INJ_coinc/'
+                                                     + ifo.upper() + '-HDF_TRIGGER_MERGE_'
+                                                     + tag + '_INJ_INJECTIONS-*-*.hdf',
+                                                     ifos=ifo, tags=curr_tags+[tag], segs=segs)
+            inj_single_det_files[-1].append(inj_single_det_file)
+
+    bank_file = return_single_file(search_dir + '/bank/*-BANK2HDF-*-*.hdf', segs=segs)
+
+    # Setup node using filter executable
+    filter_job.update_current_tags(curr_tags)
+    filter_node = filter_job.create_node(single_det_files, injfind_files, inj_single_det_files,
+                                         bank_file, segment_file, veto_file)
+    workflow.add_node(filter_node)
+    filter_file, injection_file = filter_node.output_files
+    filter_files.append(filter_file)
+    injection_files.append(injection_file)
+logging.info("Trigger filtering setup")
+
+segs = segment_files.get_times_covered_by_files()
+
+# Currently assuming that the template bank is the same for all searches
+bank_file = return_single_file(search_dir + '/bank/*-BANK2HDF-*-*.hdf', segs=segs)
+
+# Setup planning job
+logging.info("Setting up planning job")
+planning_job = PlanningExecutable(workflow.cp, 'planning', out_dir='filtered_triggers',
+                                  ifos='HLV', tags=[])
+
+planning_node = planning_job.create_node(filter_files, injection_files, segment_files)
+workflow.add_node(planning_node)
+sample_file, injection_file, segment_file = planning_node.output_files
+logging.info("Planning job setup")
+
+# Setup strain preprocessing jobs
+logging.info("Setting up preprocessing jobs")
+try:
+    factor = int(workflow.cp.get_opt_tags('workflow-preprocess-strain',
+                                          'parallelization-factor', []))
+except ConfigParser.Error:
+    factor = 1
+
+strain_job = PreprocessStrainExecutable(workflow.cp, 'preprocess-strain',
+                                        out_dir='training_samples',
+                                        ifos='HLV', tags=[])
+strain_job.update_current_retention_level(wf.Executable.INTERMEDIATE_PRODUCT)
+
+sample_files = wf.FileList([])
+
+for i in range(factor):
+    strain_job.update_current_tags([str(i)])
+    node = strain_job.create_node(sample_file, injection_file, segment_file, i, factor)
+    workflow.add_node(node)
+    sample_files.append(node.output_files[0])
+
+logging.info("Setting up sample merging job")
+merge_job = MergeSamplesExecutable(workflow.cp, 'merge-samples', out_dir='training_samples',
+                                   ifos='HLV', tags=[])
+merge_job.update_current_retention_level(wf.Executable.MERGED_TRIGGERS)
+node = merge_job.create_node(sample_files)
+workflow.add_node(node)
+training_samples = node.output_files[0]
+logging.info("Preprocessing jobs setup")
+
+# Setup training job
+logging.info("Setting up training job")
+training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_models',
+                                  ifos='HLV', tags=[])
+node = training_job.create_node(training_samples, bank_file)
+workflow.add_node(node)
+trained_model = node.output_files[0]
+logging.info("Training job setup")
+
+# Setup plotting jobs and results pages
+logging.info("Setting up plotting and results pages")
+plotting_nodes = []
+
+create_versioning_page(rdir['workflow/version'], container.cp)
+
+base = rdir['workflow/configuration']
+wf.makedir(base)
+ini_file_path = os.path.join(base, 'configuration.ini')
+with open(ini_file_path, 'w') as ini_fh:
+    container.cp.write(ini_fh)
+ini_file = wf.FileList([wf.File(workflow.ifos, '', segs,
+                        file_url='file://' + ini_file_path)])
+layout.single_layout(base, ini_file)
+
+log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', segs,
+                        extension='.html', directory=rdir['workflow'])
+
+dashboard_file = wf.File(workflow.ifos, 'DASHBOARD', segs,
+                         extension='.html', directory=rdir['workflow'])
+dashboard_str = """<center><p style="font-size:20px"><b><a href="PEGASUS_DASHBOARD_URL" target="_blank">Pegasus Dashboard Page</a></b></p></center>"""
+kwds = { 'title' : "Pegasus Dashboard",
+         'caption' : "Link to Pegasus Dashboard",
+         'cmd' : "PYCBC_SUBMIT_DAX_ARGV", }
+save_fig_with_metadata(dashboard_str, dashboard_file.storage_path, **kwds)
+
+wf.makedir(rdir['workflow/dax'])
+wf.makedir(rdir['workflow/input_map'])
+wf.makedir(rdir['workflow/output_map'])
+wf.makedir(rdir['workflow/planning'])
+
+wf.make_results_web_page(finalize_workflow, os.path.join(os.getcwd(), rdir.base))
+
+container += workflow
+container += finalize_workflow
+
+import Pegasus.DAX3 as dax
+dep = dax.Dependency(parent=workflow.as_job, child=finalize_workflow.as_job)
+container._adag.addDependency(dep)
+
+container.save()
+
+logging.info("Written dax.")
+
+logging.shutdown()
+with open (wf_log_file.storage_path, "r") as logfile:
+    logdata=logfile.read()
+log_str = """
+<p>Workflow generation script created workflow in output directory: %s</p>
+<p>Workflow name is: %s</p>
+<p>Workflow generation script run on host: %s</p>
+<pre>%s</pre>
+""" % (os.getcwd(), args.workflow_name, socket.gethostname(), logdata)
+kwds = { 'title' : 'Workflow Generation Log',
+         'caption' : "Log of the workflow script %s" % sys.argv[0],
+         'cmd' :' '.join(sys.argv), }
+save_fig_with_metadata(log_str, log_file_html.storage_path, **kwds)
+layout.single_layout(rdir['workflow'], ([dashboard_file,log_file_html]))
