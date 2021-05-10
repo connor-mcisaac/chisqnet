@@ -24,7 +24,7 @@ def return_single_filestr(regex):
     return check[0]
 
 
-def return_single_file(regex, ifos='HLV', segs=None, tags=[]):
+def return_single_file(regex, ifos='H1L1V1', segs=None, tags=[]):
     filestr = return_single_filestr(regex)
     file_attrs = {'ifos': ifos,
                   'segs': segs,
@@ -79,7 +79,7 @@ logging.info("Created log file %s" % wf_log_file.storage_path)
 # Gather input files from config and setup filtering jobs
 logging.info("Setting up trigger filtering")
 filter_job = FilterTriggersExecutable(workflow.cp, 'filter', out_dir='filtered_triggers',
-                                      ifos='HLV', tags=[])
+                                      ifos=workflow.ifos, tags=[])
 
 filter_files = wf.FileList([])
 injection_files = wf.FileList([])
@@ -151,7 +151,7 @@ bank_file = return_single_file(search_dir + '/bank/*-BANK2HDF-*-*.hdf', segs=seg
 # Setup planning job
 logging.info("Setting up planning job")
 planning_job = PlanningExecutable(workflow.cp, 'planning', out_dir='filtered_triggers',
-                                  ifos='HLV', tags=[])
+                                  ifos=workflow.ifos, tags=[])
 
 planning_node = planning_job.create_node(filter_files, injection_files, segment_files)
 workflow.add_node(planning_node)
@@ -168,7 +168,7 @@ except ConfigParser.Error:
 
 strain_job = PreprocessStrainExecutable(workflow.cp, 'preprocess-strain',
                                         out_dir='training_samples',
-                                        ifos='HLV', tags=[])
+                                        ifos=workflow.ifos, tags=[])
 strain_job.update_current_retention_level(wf.Executable.INTERMEDIATE_PRODUCT)
 
 sample_files = wf.FileList([])
@@ -181,7 +181,7 @@ for i in range(factor):
 
 logging.info("Setting up sample merging job")
 merge_job = MergeSamplesExecutable(workflow.cp, 'merge-samples', out_dir='training_samples',
-                                   ifos='HLV', tags=[])
+                                   ifos=workflow.ifos, tags=[])
 merge_job.update_current_retention_level(wf.Executable.MERGED_TRIGGERS)
 node = merge_job.create_node(sample_files)
 workflow.add_node(node)
@@ -191,7 +191,7 @@ logging.info("Preprocessing jobs setup")
 # Setup training job
 logging.info("Setting up training job")
 training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_models',
-                                  ifos='HLV', tags=[])
+                                  ifos=workflow.ifos, tags=[])
 node = training_job.create_node(training_samples, bank_file)
 workflow.add_node(node)
 trained_model = node.output_files[0]

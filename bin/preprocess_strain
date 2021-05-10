@@ -112,8 +112,13 @@ with h5py.File(args.output_file, 'w') as f:
                                  ['ifo'], ['U2'])
 
         logging.info("Loading strain")
-        seg_strain = strain_from_cli(seg_ifo, seg_load, args,
-                                     dyn_range_fac=DYN_RANGE_FAC, precision='single')
+        try:
+            seg_strain = strain_from_cli(seg_ifo, seg_load, args,
+                                         dyn_range_fac=DYN_RANGE_FAC, precision='single')
+        except RuntimeError as e:
+            logging.info("Skipping segment due to run-time error: {0}".format(e))
+            continue
+
         logging.info("Segmenting strain")
         seg_segs = StrainSegmentsCut.from_cli(args, seg_strain)
         seg_segs.cut(seg_times, args.snr_cut_width)

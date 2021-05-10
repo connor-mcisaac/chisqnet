@@ -138,8 +138,10 @@ for ifo in samples.ifos:
                 end = seg[1]
                 start = seg[1] - args.segment_length
 
-            l_segs.append(segment(start, end))
-            a_segs.append(segment(analyse_start, end))
+            triggers = samples.get_time_cut(ifo, analyse_start, end)
+            if len(triggers) > 0:
+                l_segs.append(segment(start, end))
+                a_segs.append(segment(analyse_start, end))
             
     segs[ifo + ':LOAD'] = segmentlist(l_segs)
     segs[ifo + ':ANALYSE'] = segmentlist(a_segs)
