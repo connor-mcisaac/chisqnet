@@ -1,0 +1,114 @@
+#!/usr/bin/env python
+
+"""
+Script for creating a workflow to preprocess data for training a model.
+"""
+
+import os, argparse
+import pycbc.workflow as wf
+from ligo import segments
+import pycbc.workflow.pegasus_workflow as wdax
+from chisqnet.workflow import PreprocessStrainExecutable, sngl_ifo_job_setup, MergeSamplesExecutable
+
+
+def to_file(path, ifo=None):
+    fil = wdax.File(os.path.basename(path))
+    fil.ifo = ifo
+    path = os.path.abspath(path)
+    fil.PFN(path, 'local')
+    return fil
+
+
+parser = argparse.ArgumentParser(description=__doc__[1:])
+#parser.add_argument('--version', action='version', version=__version__)
+parser.add_argument('--workflow-name', default='my_unamed_run')
+parser.add_argument("-d", "--output-dir", default=None,
+                    help="Path to output directory.")
+parser.add_argument("--trigger-file", required=True,
+                    help="Path to the trigger file.")
+parser.add_argument("--injection-file", default=None,
+                    help="Path to the injection file.")
+parser.add_argument("--output-file", type=str, default=None,
+                    help="Specify the output file name. Either a name can be "
+                         "provided or a full path to file. If this is not "
+                         "given a filename and location is chosen "
+                         "automatically.")
+parser.add_argument("--dax-filename", type=str, default=None,
+                    help="This can be used if running this job in a "
+                         "sub-workflow to specify the dax filename.")
+parser.add_argument("--map-filename", type=str, default=None,
+                    help="This can be used if running this job in a "
+                         "sub-workflow to specify the output map filename. "
+                         "WARNING: Giving this if not running as a "
+                         "sub-workflow will cause pycbc_submit_dax to not "
+                         "work.")
+parser.add_argument("--transformation-catalog-filename", type=str, default=None,
+                    help="See workflow/core.py")
+parser.add_argument("--is-sub-workflow", default=False, action="store_true",
+                    help="Only give this option if this code is being run "
+                    "as a sub-workflow within pegasus. If this means nothing "
+                    "to you, do not give this option.")
+parser.add_argument("--tags", default=[], nargs="*", action="store",
+                    help="If this option is given all jobs, and all workflow "
+                          "configuration options, will use the tags given "
+                          "here. This can be used if running this as a "
+                          "sub-workflow to give two sets of options to two "
+                          "different invocations of the sbank workflow.")
+wf.add_workflow_command_line_group(parser)
+args = parser.parse_args()
+
+workflow = wf.Workflow(args, args.workflow_name)
+
+if not args.is_sub_workflow:
+    wf.makedir(args.output_dir)
+    os.chdir(args.output_dir)
+    args.output_dir = '.'
+
+trigger_file = to_file(args.trigger_file)
+if args.injection_file:
+    injection_file = to_file(args.injection_file)
+else:
+    injection_file = None
+
+# Get segments and find the data locations
+sci_seg_name = 'science'
+science_seg_file = wf.get_segments_file(workflow, sci_seg_name, 'segments-science',
+                                        os.path.join(args.output_dir, 'segments'))
+
+ssegs = {}
+for ifo in workflow.ifos:
+    ssegs[ifo] = science_seg_file.segment_dict["%s:science" % ifo]
+
+datafind_files, analyzable_file, analyzable_segs, analyzable_name = \
+                                           wf.setup_datafind_workflow(workflow,
+                                     ssegs, "datafind",
+                                     seg_file=science_seg_file)
+
+final_veto_name = 'vetoes'
+final_veto_file = wf.get_segments_file(workflow, final_veto_name,
+                                       'segments-vetoes',
+                                       os.path.join(args.output_dir, 'segments'))
+
+samples_dir = os.path.join(args.output_dir, 'samples')
+wf.make_analysis_dir(samples_dir)
+
+preprocess_out = wf.FileList([])
+
+for ifo in workflow.ifos:
+    
+    preprocess_job = PreprocessStrainExecutable(workflow.cp, 'preprocess-strain',
+                                                trigger_file, ifo=ifo, out_dir=samples_dir,
+                                                injection_file=injection_file, tags=args.tags)
+
+    sngl_ifo_job_setup(workflow, ifo, preprocess_out, preprocess_job,
+                       analyzable_segs[ifo], datafind_files, args.trigger_file,
+                       allow_overlap=False)
+
+merge_job = MergeSamplesExecutable(workflow.cp, 'merge-samples', out_dir=args.output_dir,
+                                   ifos=workflow.ifos, tags=args.tags)
+merge_job.update_current_retention_level(wf.Executable.FINAL_RESULT)
+node = merge_job.create_node(preprocess_out, output=args.output_file)
+workflow.add_node(node)
+
+workflow.save(filename=args.dax_filename, output_map_path=args.map_filename,
+              transformation_catalog_path=args.transformation_catalog_filename)

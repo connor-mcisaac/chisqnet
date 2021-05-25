@@ -18,6 +18,7 @@ parser.add_argument("--output-file", required=True,
                     help="Output location")
 
 # Gather additional options
+parser.add_argument("--remove-injection-params", action='store_true')
 parser.add_argument("--verbose", action='store_true')
 
 args = parser.parse_args()
@@ -36,6 +37,14 @@ for fp in args.sample_files:
     with h5py.File(fp, 'r') as f:
         file_attrs(f)
         f.visititems(file_data)
+
+if args.remove_injection_params:
+    injection_keys = []
+    for k in file_data.datasets.keys():
+        if k.startswith("inj:") or k == "injection_index":
+            injection_keys.append(k)
+    for k in injection_keys:
+        _ = file_data.datasets.pop(k)
 
 file_data.concatenate_datasets()
 file_data.check_lengths()

@@ -1,0 +1,85 @@
+#! /usr/bin/env python
+
+import sys
+import argparse
+import h5py
+import numpy as np
+from chisqnet.filtering import ShiftTransform
+import tensorflow as tf
+import pycbc.results
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+
+parser = argparse.ArgumentParser()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input-file", required=True,
+                    help="File containing loss to be plotted")
+parser.add_argument("--output-file", required=True,
+                    help="Location of the output file")
+
+parser.add_argument("--shift-num", default=8, type=int,
+                    help="The number of shift transformations to train")
+parser.add_argument("--poly-degree", default=2, type=int,
+                    help="The degree of the polynomial use in the shift transformations")
+parser.add_argument("--base-time-shift", default=0.01, type=float,
+                    help="The maximum time shift that can be caused by a single term in "
+                         "the polynomial.")
+parser.add_argument("--base-freq-shift", default=10., type=float,
+                    help="The maximum frequency shift that can be caused by a single term in "
+                         "the polynomial.")
+parser.add_argument("--shift-param", default="mtotal", type=str,
+                    help="The parameter used to calculate the time and frequency shifts")
+parser.add_argument("--min-param", default=100, type=float,
+                    help="The maximum parameter used to plot")
+parser.add_argument("--max-param", default=500, type=float,
+                    help="The maximum parameter used to plot")
+
+args = parser.parse_args()
+
+with h5py.File(args.input_file, 'r') as f:
+     dfs = tf.convert_to_tensor(f['df'][-1, :, :])
+     dts = tf.convert_to_tensor(f['dt'][-1, :, :])
+     thresh = f['thresh'][-1, 0]
+
+transform = ShiftTransform(args.shift_num, args.poly_degree,
+                           args.base_time_shift,
+                           args.base_freq_shift,
+                           args.max_param,
+                           np.arange(10), 1., 10)
+
+transform.df_base = dfs
+transform.dt_base = dts
+
+params = tf.Variable(np.linspace(args.min_param, args.max_param, num=100, endpoint=True),
+                     dtype=tf.float32)
+dfs = transform.get_df(params).numpy()
+dts = transform.get_dt(params).numpy()
+params = params.numpy()
+
+caption = "This is a plot of the time and frequency shifts " \
+	  "for different masses of templates."
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+for i in range(args.shift_num):
+    sc = ax.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool")
+
+ax.set_title("threshold = {0:.4f}".format(thresh), fontsize="large")
+
+ax.set_xlim((-np.max(dts), np.max(dts)))
+ax.set_ylim((-np.max(dfs), np.max(dfs)))
+
+ax.set_xlabel('Time Shift (s)', fontsize='large')
+ax.set_ylabel('Frequency Shift (Hz)', fontsize='large')
+ax.grid()
+
+cbar = plt.colorbar(sc)
+cbar.ax.set_ylabel(args.shift_param, fontsize='large')
+
+pycbc.results.save_fig_with_metadata(fig, args.output_file,
+     title='Time-Frequency Shifts',
+     caption=caption,
+     cmd=' '.join(sys.argv))

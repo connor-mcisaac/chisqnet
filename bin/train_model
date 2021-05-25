@@ -66,7 +66,7 @@ def nc_chi2(x, df, nc):
 
 parser = argparse.ArgumentParser()
 
-# Gather inputs from planning step, Injection file is included in strain options group
+# Gather inputs
 parser.add_argument("--sample-file", required=True,
                     help="Sample file to be used in training")
 
@@ -136,7 +136,6 @@ else:
     log_level = logging.WARNING
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
-# Check option groups
 samples = SampleFile(args.sample_file)
 
 template_mem = zeros(samples.tlen, dtype=complex64)

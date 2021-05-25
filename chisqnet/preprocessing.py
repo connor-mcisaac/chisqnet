@@ -98,6 +98,9 @@ class TriggerList(object):
                 self.triggers[ifo] = add_params(self.triggers[ifo], updates,
                                                 names, dtypes)
 
+        self._params += names
+        self._dtypes += dtypes
+
     def get_newsnr_sg(self):
         for ifo in self.ifos:
             updates = []
@@ -122,6 +125,9 @@ class TriggerList(object):
             if len(updates) > 0:
                 self.triggers[ifo] = add_params(self.triggers[ifo], updates,
                                                 names, dtypes)
+
+        self._params += names
+        self._dtypes += dtypes
 
     def threshold_cut(self, thresh, param):
         
@@ -263,7 +269,7 @@ class TriggerList(object):
 
 class InjectionTriggers(TriggerList):
     
-    def __init__(self, inj_finds, inj_trigs, approximants, f_lowers=None):
+    def __init__(self, inj_find, inj_trigs, approximant=None, f_lower=None):
 
         self._inj_params = _inj_in_params[:] + _inj_ex_params[:]
         self._inj_dtypes = _inj_in_dtypes[:] + _inj_ex_dtypes[:]
@@ -278,53 +284,47 @@ class InjectionTriggers(TriggerList):
         self.triggers = {}
         self.nums = {}
 
-        if f_lowers is None:
-            f_lowers = [10.] * len(inj_finds)
+        trig_ids = {}
+        records = {}
 
-        for inj_find, inj_trig, approx, f_lower in zip(inj_finds, inj_trigs, approximants, f_lowers):
-
-            inj_trigs = inj_trig.split(',')
-            inj_trigs = {trig.split('/')[-1][:2]: trig for trig in inj_trigs}
-
-            trig_ids = {}
-            records = {}
-
-            with h5py.File(inj_find, 'r') as f:
-                inj_ids = f['/found_after_vetoes/injection_index'][:]
-                ifos = f.attrs['ifos'].split(' ')
-
-                for ifo in ifos:
-                    trig_id = f['/found_after_vetoes/' + ifo + '/trigger_id'][:]
-                    lgc = trig_id != -1
-                    
-                    trig_ids[ifo] = trig_id[lgc]
-                    inj_id = inj_ids[lgc]
-
-                    if ifo not in self.triggers.keys():
-                        self.triggers[ifo] = []
-                        self.nums[ifo] = 0
-
-                    num = len(trig_ids[ifo])
-                    self.nums[ifo] += num
-
-                    record = np.zeros(num, dtype={'names': self._params, 'formats': self._dtypes})
-
-                    for p in self._inj_params:
-                        record['inj:' + p] = f['injections/' + p][inj_id]
-                        record['injection'] = np.array([True] * num, dtype=bool)
-
-                    record['inj:approximant'] = np.array([approx] * num, dtype='U16')
-                    record['inj:f_lower'] = np.array([f_lower] * num, dtype='f8')
-                    record['injection_index'] = inj_id
-
-                    records[ifo] = record
+        with h5py.File(inj_find, 'r') as f:
+            inj_ids = f['/found_after_vetoes/injection_index'][:]
+            ifos = f.attrs['ifos'].split(' ')
 
             for ifo in ifos:
-                with h5py.File(inj_trigs[ifo], 'r') as f:
-                    for p in self._trig_params:
-                        records[ifo][p] = f[ifo][p][:][trig_ids[ifo]]
+                trig_id = f['/found_after_vetoes/' + ifo + '/trigger_id'][:]
+                lgc = trig_id != -1
+                    
+                trig_ids[ifo] = trig_id[lgc]
+                inj_id = inj_ids[lgc]
 
-                self.triggers[ifo].append(records[ifo])
+                if ifo not in self.triggers.keys():
+                    self.triggers[ifo] = []
+                    self.nums[ifo] = 0
+
+                num = len(trig_ids[ifo])
+                self.nums[ifo] += num
+
+                record = np.zeros(num, dtype={'names': self._params, 'formats': self._dtypes})
+
+                for p in self._inj_params:
+                    record['inj:' + p] = f['injections/' + p][inj_id]
+                    record['injection'] = np.array([True] * num, dtype=bool)
+
+                if approximant is not None:
+                    record['inj:approximant'] = np.array([approx] * num, dtype='U16')
+                if f_lower is not None:
+                    record['inj:f_lower'] = np.array([f_lower] * num, dtype='f8')
+                record['injection_index'] = inj_id
+
+                records[ifo] = record
+
+        for ifo in ifos:
+            with h5py.File(inj_trigs[ifo], 'r') as f:
+                for p in self._trig_params:
+                    records[ifo][p] = f[ifo][p][:][trig_ids[ifo]]
+
+            self.triggers[ifo].append(records[ifo])
         
         self.ifos = list(self.triggers.keys())
 
@@ -412,5 +412,5 @@ class AttributeCollector(object):
         for k in group.attrs.keys():
             if k not in self.attrs.keys():
                 self.attrs[k] = group.attrs[k]
-            elif self.attrs[k] != group.attrs[k]:
+            elif np.any(self.attrs[k] != group.attrs[k]):
                 raise ValueError("Groups have different attributes")

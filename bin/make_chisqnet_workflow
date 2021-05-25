@@ -5,32 +5,15 @@ Script for creating a workflow to prepare a training set and train a model
 for chi-squared discriminators.
 """
 
-import os, argparse, logging, glob, sys, socket
+import os, argparse, logging, sys, socket
 import pycbc.workflow as wf
+from Pegasus import DAX3 as dax
 from pycbc.results import layout, create_versioning_page
 from pycbc.results.versioning import save_fig_with_metadata
 from ligo import segments
-from six.moves import configparser as ConfigParser
-from chisqnet.workflow import FilterTriggersExecutable, PlanningExecutable, PreprocessStrainExecutable
-from chisqnet.workflow import MergeSamplesExecutable, TrainingExecutable
-
-
-def return_single_filestr(regex):
-    check = glob.glob(regex)
-    if len(check) == 0:
-        raise ValueError("No file found for " + regex)
-    elif len(check) > 1:
-        raise ValueError("Found multiple files for " + regex)
-    return check[0]
-
-
-def return_single_file(regex, ifos='H1L1V1', segs=None, tags=[]):
-    filestr = return_single_filestr(regex)
-    file_attrs = {'ifos': ifos,
-                  'segs': segs,
-                  'tags': tags}
-    pfile = wf.resolve_url_to_file(filestr, attrs=file_attrs)
-    return pfile
+from chisqnet.workflow import (FilterTriggersExecutable, PreprocessingDaxGenerator,
+                               MergeSamplesExecutable, StageoutExecutable,
+                               TrainingExecutable, PlotExecutable)
 
 
 # Log to the screen until we know where the output file is
@@ -52,10 +35,10 @@ finalize_workflow = wf.Workflow(args, args.workflow_name + '-finalization')
 wf.makedir(args.output_dir)
 os.chdir(args.output_dir)
 args.output_dir = '.'
+wf.makedir('daxes')
 
-rdir = layout.SectionNumber('results', ['filtered_triggers',
-                                        'training_samples',
-                                        'trained_models',
+rdir = layout.SectionNumber('results', ['training',
+                                        'trained_model',
                                         'workflow'])
 wf.makedir(rdir.base)
 wf.makedir(rdir['workflow'])
@@ -76,131 +59,179 @@ logfile.setFormatter(formatter)
 logging.getLogger('').addHandler(logfile)
 logging.info("Created log file %s" % wf_log_file.storage_path)
 
-# Gather input files from config and setup filtering jobs
-logging.info("Setting up trigger filtering")
+# Gather input files from config and setup filtering jobs and preprocessing
+logging.info("Setting up trigger filtering and preprocessing")
 filter_job = FilterTriggersExecutable(workflow.cp, 'filter', out_dir='filtered_triggers',
                                       ifos=workflow.ifos, tags=[])
 
-filter_files = wf.FileList([])
-injection_files = wf.FileList([])
-segment_files = wf.FileList([])
+segs = []
+subsections = workflow.cp.get_subsections('filter')
+for section in subsections:
+    curr_tags = [section.upper()]
+    start_time = workflow.cp.get_opt_tags("workflow-filter", "start-time", curr_tags)
+    end_time = workflow.cp.get_opt_tags("workflow-filter", "end-time", curr_tags)
+    seg = segments.segment([int(start_time), int(end_time)])
+    segs.append(seg)
+segs = segments.segmentlist(segs)
 
-for section in workflow.cp.get_subsections('filter'):
+# Select bank file
+bank_attrs = {'ifos': workflow.ifos,
+              'segs': segs,
+              'tags': []}
+
+bank_str = workflow.cp.get("workflow", "bank-file")
+bank_file = wf.resolve_url_to_file(bank_str, attrs=bank_attrs)
+
+sample_files = wf.FileList([])
+sub_dax_jobs = []
+
+for section in subsections:
     logging.info("Creating job for {0}".format(section))
     curr_tags = [section.upper()]
-    search_dir = workflow.cp.get_opt_tags("workflow-filter",
-                                          "search-dir",
-                                          curr_tags)
-    inj_tags = workflow.cp.get_opt_tags("workflow-filter",
-                                        "injection-tags",
-                                        curr_tags).split(" ")
 
-    # Select segment and veto files
-    segment_filestr = return_single_filestr(search_dir + '/results/1._analysis_time/1.01_segment_data/'
-                                            + '*-INSP_SEGMENTS-*-*.xml')
-    segment_file = wf.SegFile.from_segment_xml(segment_filestr)
-    segs = segment_file.segment_list
-    segment_files.append(segment_file)
+    start_time = workflow.cp.get_opt_tags("workflow-filter", "start-time", curr_tags)
+    end_time = workflow.cp.get_opt_tags("workflow-filter", "end-time", curr_tags)
+    seg = segments.segment([int(start_time), int(end_time)])
 
-    veto_file = return_single_file(search_dir + '/segments/*-FOREGROUND_CENSOR-*-*.xml', segs=segs)
+    file_attrs = {'ifos': workflow.ifos,
+                  'segs': seg,
+                  'tags': curr_tags}
 
     # Select single detector trigger files
     single_det_files = wf.FileList([])
     for ifo in workflow.ifos:
-        single_det_file = return_single_file(search_dir + '/full_data/' + ifo.upper()
-                                             + '-HDF_TRIGGER_MERGE_FULL_DATA-*-*.hdf',
-                                             ifos=ifo, tags=curr_tags, segs=segs)
+        filestr = workflow.cp.get_opt_tags("workflow-filter", ifo.lower() + "-trigger-file", curr_tags)
+        single_det_file = wf.resolve_url_to_file(filestr, attrs=file_attrs)
         single_det_files.append(single_det_file)
 
-    # Select injection files, injection-find and single detector
-    injfind_files = wf.FileList([])
-    inj_single_det_files = []
+    # Select veto file if given
+    if workflow.cp.has_option_tags("workflow-filter", "veto-file", curr_tags):
+        filestr = workflow.cp.get_opt_tags("workflow-filter", "veto-file", curr_tags)
+        veto_file = wf.resolve_url_to_file(filestr, attrs=file_attrs)
+    else:
+        veto_file = None
 
-    for inj_tag in inj_tags:
-        tag = inj_tag.upper()
-        injfind_file = return_single_file(search_dir + '/' + tag + '_INJ_coinc/*-HDFINJFIND_'
-                                          + tag + '_INJ_INJECTIONS-*-*.hdf', tags=curr_tags+[tag],
-                                          segs=segs)
-        injfind_files.append(injfind_file)
+    # Select injection and injfind files if they are given
+    injfind = workflow.cp.has_option_tags("workflow-filter", "injfind-file", curr_tags)
+    injection = workflow.cp.has_option_tags("workflow-filter", "injection-file", curr_tags)
 
-        inj_single_det_files.append(wf.FileList([]))
-        for ifo in workflow.ifos:
-            inj_single_det_file = return_single_file(search_dir + '/' + tag + '_INJ_coinc/'
-                                                     + ifo.upper() + '-HDF_TRIGGER_MERGE_'
-                                                     + tag + '_INJ_INJECTIONS-*-*.hdf',
-                                                     ifos=ifo, tags=curr_tags+[tag], segs=segs)
-            inj_single_det_files[-1].append(inj_single_det_file)
+    if injfind and injection:
+        injfind_filestr = workflow.cp.get_opt_tags("workflow-filter", "injfind-file", curr_tags)
+        injfind_file = wf.resolve_url_to_file(injfind_filestr, attrs=file_attrs)
 
-    bank_file = return_single_file(search_dir + '/bank/*-BANK2HDF-*-*.hdf', segs=segs)
+        injection_filestr = workflow.cp.get_opt_tags("workflow-filter", "injection-file", curr_tags)
+        injection_file = wf.resolve_url_to_file(injection_filestr, attrs=file_attrs)
+    elif injfind or injection:
+        raise ValueError("Both injfind-file and injection-file must be given or neither")
+    else:
+        injfind_file = None
+        injection_file = None
 
     # Setup node using filter executable
     filter_job.update_current_tags(curr_tags)
-    filter_node = filter_job.create_node(single_det_files, injfind_files, inj_single_det_files,
-                                         bank_file, segment_file, veto_file)
+    filter_node = filter_job.create_node(single_det_files, bank_file, injfind_file, veto_file)
     workflow.add_node(filter_node)
-    filter_file, injection_file = filter_node.output_files
-    filter_files.append(filter_file)
-    injection_files.append(injection_file)
-logging.info("Trigger filtering setup")
+    trigger_file = filter_node.output_files[0]
 
-segs = segment_files.get_times_covered_by_files()
+    # Setup Preprocessing sub-workflow
+    config_path = os.path.abspath('daxes' + '/' + 'preprocessing_' + section + '.ini')
+    workflow.cp.write(open(config_path, 'w'))
+    config_file = wf.File.from_path(config_path)
 
-# Currently assuming that the template bank is the same for all searches
-bank_file = return_single_file(search_dir + '/bank/*-BANK2HDF-*-*.hdf', segs=segs)
+    preprocessing_exe = PreprocessingDaxGenerator(workflow.cp, 'preprocessing',
+                                                  ifos=workflow.ifos, out_dir='daxes')
 
-# Setup planning job
-logging.info("Setting up planning job")
-planning_job = PlanningExecutable(workflow.cp, 'planning', out_dir='filtered_triggers',
-                                  ifos=workflow.ifos, tags=[])
+    preprocessing_out_dir = os.path.abspath('preprocessing_' + section)
+    sample_file_sub = wf.File(preprocessing_exe.ifo_list, preprocessing_exe.name,
+                              seg, extension='.hdf', store_file=True,
+                              directory=preprocessing_out_dir,
+                              tags=curr_tags+['SUB'], use_tmp_subdirs=False)
 
-planning_node = planning_job.create_node(filter_files, injection_files, segment_files)
-workflow.add_node(planning_node)
-sample_file, injection_file, segment_file = planning_node.output_files
-logging.info("Planning job setup")
+    sub_workflow_name = 'preprocessing_' + section + '_workflow'
+    preprocessing_node = preprocessing_exe.create_node(seg, config_file,
+                                                       subsections,
+                                                       preprocessing_out_dir,
+                                                       sample_file_sub,
+                                                       trigger_file, injection_file,
+                                                       workflow_name=sub_workflow_name,
+                                                       sub_wf_tags=curr_tags)
 
-# Setup strain preprocessing jobs
-logging.info("Setting up preprocessing jobs")
-try:
-    factor = int(workflow.cp.get_opt_tags('workflow-preprocess-strain',
-                                          'parallelization-factor', []))
-except ConfigParser.Error:
-    factor = 1
+    workflow.add_node(preprocessing_node)
 
-strain_job = PreprocessStrainExecutable(workflow.cp, 'preprocess-strain',
-                                        out_dir='training_samples',
-                                        ifos=workflow.ifos, tags=[])
-strain_job.update_current_retention_level(wf.Executable.INTERMEDIATE_PRODUCT)
+    dax_file = preprocessing_node.output_files[0]
+    map_file = preprocessing_node.output_files[1]
+    tc_file = preprocessing_node.output_files[2]
+    dax_job = dax.DAX(dax_file)
+    dax_job.addArguments('--basename %s' % \
+                         os.path.splitext(os.path.basename(dax_file.name))[0])
+    wf.Workflow.set_job_properties(dax_job, map_file, tc_file)
 
-sample_files = wf.FileList([])
+    #dax_job.uses(trigger_file, link=dax.Link.INPUT, register=False, transfer=True)
+    #if injection_file is not None:
+    #    dax_job.uses(injection_file, link=dax.Link.INPUT, register=False, transfer=True)
 
-for i in range(factor):
-    strain_job.update_current_tags([str(i)])
-    node = strain_job.create_node(sample_file, injection_file, segment_file, i, factor)
+    workflow._adag.addJob(dax_job)
+    dep = dax.Dependency(parent=preprocessing_node._dax_node, child=dax_job)
+    workflow._adag.addDependency(dep)
+    sub_dax_jobs.append(dax_job)
+
+    # In order to use the samples file in the workflow we pegasus must know how it is generated.
+    # Registering samples_file_sub as an output file will add it to the input catalogue and it
+    # will never be generated.
+    # Instead copy it to a new file and make the copy job dependant on the sub-dax.
+    sample_file = wf.File(preprocessing_exe.ifo_list, preprocessing_exe.name,
+                          seg, extension='.hdf', store_file=True,
+                          directory='training_samples',
+                          tags=curr_tags, use_tmp_subdirs=False)
+    
+    stageout_exe = StageoutExecutable(workflow.cp, 'manual-stageout', out_dir=args.output_dir,
+                                      ifos=workflow.ifos, tags=curr_tags+['PREPROCESSING'])
+    node = stageout_exe.create_node(sample_file_sub, sample_file)
     workflow.add_node(node)
-    sample_files.append(node.output_files[0])
 
+    dep = dax.Dependency(parent=dax_job, child=node._dax_node)
+    workflow._adag.addDependency(dep)
+
+    sample_files.append(sample_file)
+
+logging.info("Trigger filtering and preprocessing setup")
+
+# Setup job to merge samples
 logging.info("Setting up sample merging job")
 merge_job = MergeSamplesExecutable(workflow.cp, 'merge-samples', out_dir='training_samples',
-                                   ifos=workflow.ifos, tags=[])
+                                   ifos=workflow.ifos, tags=['all'])
 merge_job.update_current_retention_level(wf.Executable.MERGED_TRIGGERS)
 node = merge_job.create_node(sample_files)
 workflow.add_node(node)
 training_samples = node.output_files[0]
-logging.info("Preprocessing jobs setup")
 
 # Setup training job
 logging.info("Setting up training job")
-training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_models',
+training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
                                   ifos=workflow.ifos, tags=[])
 node = training_job.create_node(training_samples, bank_file)
 workflow.add_node(node)
 trained_model = node.output_files[0]
 logging.info("Training job setup")
 
-# Setup plotting jobs and results pages
-logging.info("Setting up plotting and results pages")
-plotting_nodes = []
 
+# Setup plotting jobs
+logging.info("Setting up plotting jobs")
+
+loss_job = PlotExecutable(workflow.cp, 'plot-loss', out_dir=rdir['training'],
+                          ifos=workflow.ifos, tags=[])
+node = loss_job.create_node(trained_model)
+workflow.add_node(node)
+layout.two_column_layout(rdir['training'], [(node.output_files[0],)])
+
+shift_job = PlotExecutable(workflow.cp, 'plot-shifts', out_dir=rdir['trained_model'],
+                           ifos=workflow.ifos, tags=[])
+node = shift_job.create_node(trained_model)
+workflow.add_node(node)
+layout.two_column_layout(rdir['trained_model'], [(node.output_files[0],)])
+
+# Create results pages
+logging.info("Setting up results pages")
 create_versioning_page(rdir['workflow/version'], container.cp)
 
 base = rdir['workflow/configuration']
@@ -208,14 +239,14 @@ wf.makedir(base)
 ini_file_path = os.path.join(base, 'configuration.ini')
 with open(ini_file_path, 'w') as ini_fh:
     container.cp.write(ini_fh)
-ini_file = wf.FileList([wf.File(workflow.ifos, '', segs,
+ini_file = wf.FileList([wf.File(workflow.ifos, '', trained_model.segment,
                         file_url='file://' + ini_file_path)])
 layout.single_layout(base, ini_file)
 
-log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', segs,
+log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', trained_model.segment,
                         extension='.html', directory=rdir['workflow'])
 
-dashboard_file = wf.File(workflow.ifos, 'DASHBOARD', segs,
+dashboard_file = wf.File(workflow.ifos, 'DASHBOARD', trained_model.segment,
                          extension='.html', directory=rdir['workflow'])
 dashboard_str = """<center><p style="font-size:20px"><b><a href="PEGASUS_DASHBOARD_URL" target="_blank">Pegasus Dashboard Page</a></b></p></center>"""
 kwds = { 'title' : "Pegasus Dashboard",
@@ -233,7 +264,6 @@ wf.make_results_web_page(finalize_workflow, os.path.join(os.getcwd(), rdir.base)
 container += workflow
 container += finalize_workflow
 
-import Pegasus.DAX3 as dax
 dep = dax.Dependency(parent=workflow.as_job, child=finalize_workflow.as_job)
 container._adag.addDependency(dep)
 
