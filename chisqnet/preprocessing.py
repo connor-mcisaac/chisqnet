@@ -14,8 +14,8 @@ from pycbc.waveform import get_fd_waveform, apply_fseries_time_shift
 _trigger_params = ['snr', 'chisq', 'chisq_dof', 'sg_chisq', 'end_time', 'template_id']
 _trigger_dtypes = ['f8', 'f8', 'i4', 'f8', 'f8', 'i4']
 
-_bank_params = ['mass1', 'mass2', 'spin1z', 'spin2z', 'template_duration']
-_bank_dtypes = ['f8', 'f8', 'f8', 'f8', 'f8']
+_bank_params = ['mass1', 'mass2', 'spin1z', 'spin2z', 'template_duration', 'template_hash']
+_bank_dtypes = ['f8', 'f8', 'f8', 'f8', 'f8', 'i8']
 
 _temp_params = ['mass1', 'mass2', 'spin1z', 'spin2z', 'approximant']
 

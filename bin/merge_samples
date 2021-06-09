@@ -16,6 +16,8 @@ parser.add_argument("--sample-files", nargs='+', required=True,
 # Gather output options
 parser.add_argument("--output-file", required=True,
                     help="Output location")
+parser.add_argument("--bank-file", required=False,
+                    help="Output location of bank file")
 
 # Gather additional options
 parser.add_argument("--remove-injection-params", action='store_true')
@@ -33,21 +35,58 @@ logging.info("Reading and combining sample files")
 
 file_attrs = AttributeCollector()
 file_data = DataCollector()
+ifos = set()
 for fp in args.sample_files:
     with h5py.File(fp, 'r') as f:
+        for ifo in f.keys():
+            ifos.add(ifo)
         file_attrs(f)
         f.visititems(file_data)
+ifos = list(ifos)
 
 if args.remove_injection_params:
     injection_keys = []
     for k in file_data.datasets.keys():
-        if k.startswith("inj:") or k == "injection_index":
+        param = k.split("/")[-1]
+        if param.startswith("inj:") or param == "injection_index":
             injection_keys.append(k)
     for k in injection_keys:
         _ = file_data.datasets.pop(k)
 
 file_data.concatenate_datasets()
-file_data.check_lengths()
+#file_data.check_lengths()
+
+if args.bank_file:
+    logging.info("Creating template bank")
+
+    bank_params = ['mass1', 'mass2', 'spin1z', 'spin2z',
+                   'template_duration', 'template_hash']
+
+    temp = {param: [] for param in bank_params}
+    for ifo in ifos:
+        for param in bank_params:
+            temp[param].append(file_data.datasets[ifo + '/' + param])
+    
+    nums = [0] + [len(p) for p in temp['template_hash']]
+    cumnums = np.cumsum(nums)
+
+    for param in bank_params:
+        temp[param] = np.concatenate(temp[param], axis=0)
+
+    new_hash, bank_idx, temp_id = np.unique(temp['template_hash'],
+                                            return_index=True,
+                                            return_inverse=True)
+
+    for i, ifo in enumerate(ifos):
+        file_data.datasets[ifo + '/template_id'] = temp_id[cumnums[i]:cumnums[i+1]]
+
+    with h5py.File(args.bank_file, 'w') as f:
+        
+        for param in bank_params:
+            data = temp[param][bank_idx]
+            _ = f.create_dataset(param, data=data)
+
+        f.attrs['parameters'] = bank_params
 
 logging.info("Saving combined sample file")
 
@@ -57,6 +96,7 @@ with h5py.File(args.output_file, 'w') as f:
         f.attrs[k] = v
 
     for k, v in file_data.datasets.items():
-        _ = f.create_dataset(k, data=v)
+        _ = f.create_dataset(k, data=v)    
+
 
 logging.info("Done!")

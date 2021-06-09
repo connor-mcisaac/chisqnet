@@ -1,0 +1,46 @@
+#!/usr/bin/python
+
+import argparse
+import h5py
+import numpy as np
+import pycbc.results
+import sys
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--sample-file', required=True,
+                    help='Sample file to summarise.')
+parser.add_argument('--output-file', required=True,
+                    help='Path of the output HTML file.')
+parser.add_argument('--ifos', nargs='+', default=['H1', 'L1', 'V1'],
+                    help='List of detectors.')
+args = parser.parse_args()
+
+names = ['IFO', 'Total', 'Number of samples', 'Number of Injections']
+ifos = []
+tots = []
+nums = []
+injs = []
+
+for ifo in args.ifos:
+    with h5py.File(args.sample_file, 'r') as f:
+        if ifo in f.keys():
+            ifos.append(ifo)
+            tots.append(f[ifo]['injection'].size)
+            injs.append(np.sum(f[ifo]['injection'][:]))
+            nums.append(tots[-1] - injs[-1])
+
+cols = [np.array(ifos, dtype=str),
+        np.array(tots, dtype=int),
+        np.array(nums, dtype=int),
+        np.array(injs, dtype=int)]
+
+title = "Sample Summary"
+caption = "A table containing information about the samples in each detector."
+
+html_table = pycbc.results.html_table(cols, names, page_size=10)
+pycbc.results.save_fig_with_metadata(str(html_table), args.output_file,
+                                     fig_kwds={},
+                                     title=title,
+                                     cmd=' '.join(sys.argv),
+                                     caption=caption)

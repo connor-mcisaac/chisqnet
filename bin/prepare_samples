@@ -1,0 +1,102 @@
+#! /usr/bin/env python
+
+import argparse
+import logging
+import h5py
+import numpy as np
+from chisqnet.preprocessing import DataCollector, AttributeCollector
+
+
+parser = argparse.ArgumentParser()
+
+# Gather inputs from preprocessing step
+parser.add_argument("--sample-file", required=True,
+                    help="Path to sample file")
+
+# Gather output options
+parser.add_argument("--training-file", required=True,
+                    help="Output location of training set")
+parser.add_argument("--validation-file", required=True,
+                    help="Output location of validation set")
+
+# Gather options for validation set
+parser.add_argument("--validation-fraction", default=0.1, type=float,
+                    help="Fraction of the samples to be split into a validation set")
+
+# Gather additional options
+parser.add_argument("--verbose", action='store_true')
+
+args = parser.parse_args()
+
+if args.verbose:
+    log_level = logging.DEBUG
+else:
+    log_level = logging.WARNING
+logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
+
+logging.info("Reading and flattening sample file")
+
+file_attrs = AttributeCollector()
+file_data = DataCollector()
+with h5py.File(args.sample_file, 'r') as f:
+     ifos = list(f.keys())
+     file_attrs(f)
+     f.visititems(file_data)
+
+file_data.concatenate_datasets()
+
+dataset = {}
+for ifo in ifos:
+    params = []
+    for k in file_data.datasets.keys():
+        if k.startswith(ifo):
+            params.append(k.split("/")[-1])
+    datalen = None
+    for k in params:
+        if datalen is None:
+            datalen = file_data.datasets[ifo + "/" + k].shape[0]
+        elif datalen != file_data.datasets[ifo + "/" + k].shape[0]:
+            raise ValueError("All datsets for a sigle ifo should have the same length")
+        data = file_data.datasets.pop(ifo + "/" + k)
+        if k not in dataset.keys():
+            dataset[k] = [data]
+        else:
+            dataset[k].append(data)
+    ifos = np.array([ifo] * datalen, dtype='S')
+    if 'ifo' not in dataset.keys():
+        dataset['ifo'] = [ifos]
+    else:
+        dataset['ifo'].append(ifos)
+
+for k in dataset.keys():
+    dataset[k] = np.concatenate(dataset[k], axis=0)
+
+
+logging.info("Saving training and validation files")
+
+num = dataset['ifo'].shape[0]
+validation_num = int(np.ceil(num * args.validation_fraction))
+
+idxs = np.arange(num)
+np.random.shuffle(idxs)
+
+training_idxs = idxs[:-validation_num]
+validation_idxs = idxs[-validation_num:]
+
+with h5py.File(args.training_file, 'w') as f:
+    
+    for k, v in file_attrs.attrs.items():
+        f.attrs[k] = v
+
+    for k, v in dataset.items():
+        _ = f.create_dataset(k, data=v[training_idxs])
+
+with h5py.File(args.validation_file, 'w') as f:
+    
+    for k, v in file_attrs.attrs.items():
+        f.attrs[k] = v
+
+    for k, v in dataset.items():
+        _ = f.create_dataset(k, data=v[validation_idxs])
+
+logging.info("Done!")

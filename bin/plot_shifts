@@ -69,8 +69,8 @@ for i in range(args.shift_num):
 
 ax.set_title("threshold = {0:.4f}".format(thresh), fontsize="large")
 
-ax.set_xlim((-np.max(dts), np.max(dts)))
-ax.set_ylim((-np.max(dfs), np.max(dfs)))
+ax.set_xlim((-1.1 * np.max(dts), 1.1 * np.max(dts)))
+ax.set_ylim((-1.1 * np.max(dfs), 1.1 * np.max(dfs)))
 
 ax.set_xlabel('Time Shift (s)', fontsize='large')
 ax.set_ylabel('Frequency Shift (Hz)', fontsize='large')

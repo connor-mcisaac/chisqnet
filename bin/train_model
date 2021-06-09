@@ -47,6 +47,25 @@ class SampleFile(object):
         params = self.get_params(param, idxs)
         return np.min(params), np.max(params)
 
+    def get_tensors(self, idxs, bank, shift_param):
+        segs, psds, cuts, tids, injs = self.get_samples(idxs)
+        temp = np.stack([bank[tid].numpy().copy() for tid in tids])
+        gather_idxs = np.zeros((len(idxs), cuts[0, 1] - cuts[0, 0], 2), dtype=int)
+        for k, cut in enumerate(cuts):
+            gather_idxs[k, :, 0] = k
+            gather_idxs[k, :, 1] = np.arange(cut[0], cut[1])
+        param = self.get_params(shift_param, idxs)
+
+        segs = tf.convert_to_tensor(segs, dtype=tf.complex64)
+        psds = tf.convert_to_tensor(psds, dtype=tf.float32)
+        temp = tf.convert_to_tensor(temp, dtype=tf.complex64)
+        injs = tf.convert_to_tensor(injs, dtype=tf.bool)
+        gather_idxs = tf.convert_to_tensor(gather_idxs, dtype=tf.int64)
+    
+        param = tf.convert_to_tensor(param, dtype=tf.float32)
+        
+        return segs, psds, temp, injs, gather_idxs, param
+
 
 def chi2(x, df):
     term1 = tf.math.log(x) * (0.5 * df - 1)
@@ -64,11 +83,67 @@ def nc_chi2(x, df, nc):
     corr = tfp.math.log_bessel_ive(df2, xs * ns) - tf.math.log(2.)
     return res + corr
 
+
+def batch(segs, psds, temp, injs, gather_idxs, param):
+
+    chi_temps = transform.transform(temp, param)
+    #chi_temps = transform.transform(temp)
+    logging.info("Templates transformed")
+
+    chi_orthos, ortho_lgc =  transform.get_ortho(chi_temps, temp, psds)
+    logging.info("Orthogonal templates created")
+
+    snrs, _ = match.matched_filter(temp, segs, psds)
+
+    snr = snrs[:, 0, :]
+
+    snr_cut = tf.gather_nd(snr, gather_idxs)
+    max_snr = tf.math.argmax(snr_cut, axis=-1)
+
+    idx = max_snr + gather_idxs[:, 0, 1]
+    gather_max = tf.stack([tf.range(len(idxs), dtype=tf.int64), idx], axis=-1)
+
+    snr_max = tf.gather_nd(snr, gather_max)
+    
+    chis, match_lgc = match.matched_filter(chi_orthos, segs, psds, idx=idx)
+
+    lgc = tf.math.logical_and(ortho_lgc, match_lgc)
+    mask = tf.cast(lgc, tf.float32)[:, :, 0]
+    ortho_num = tf.reduce_sum(mask, axis=1)
+    
+    chis = chis * tf.stop_gradient(mask)
+
+    logging.info("SNRs calculated")
+
+    chisq = tf.math.reduce_sum(chis ** 2., axis=1)
+    rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
+
+    chisq_thresh = rchisq / threshold
+    chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
+
+    snr_prime = snr_max / chisq_thresh ** 0.5
+
+    logging.info("SNR' calculated")
+
+    #trig_loss = - chi2(snr_prime ** 2., 2.)
+    #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
+    above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
+    trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
+    inj_loss = chisq_thresh ** 0.5
+
+    batch_loss = tf.where(injs, inj_loss, trig_loss)
+    logging.info("Loss calculated")
+
+    return batch_loss
+
+
 parser = argparse.ArgumentParser()
 
 # Gather inputs
-parser.add_argument("--sample-file", required=True,
+parser.add_argument("--training-sample-file", required=True,
                     help="Sample file to be used in training")
+parser.add_argument("--validation-sample-file", required=True,
+                    help="Sample file to be used in validation")
 
 # Gather arguments for filtering/bank
 parser.add_argument("--bank-file", required=True,
@@ -136,33 +211,36 @@ else:
     log_level = logging.WARNING
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
-samples = SampleFile(args.sample_file)
+training_samples = SampleFile(args.training_sample_file)
+validation_samples = SampleFile(args.validation_sample_file)
 
-template_mem = zeros(samples.tlen, dtype=complex64)
+template_mem = zeros(training_samples.tlen, dtype=complex64)
 
 if args.enable_bank_start_frequency:
     low_frequency_cutoff = None
 else:
     low_frequency_cutoff = args.low_frequency_cutoff
 
-bank = waveform.FilterBank(args.bank_file, samples.flen, samples.delta_f,
+bank = waveform.FilterBank(args.bank_file, training_samples.flen, training_samples.delta_f,
                            low_frequency_cutoff=low_frequency_cutoff,
                            dtype=complex64, phase_order=args.order,
                            taper=args.taper_template, approximant=args.approximant,
                            out=template_mem, max_template_length=args.max_template_length)
 
-freqs = np.arange(samples.flen) * samples.delta_f
+freqs = np.arange(training_samples.flen) * training_samples.delta_f
 
-match = MatchedFilter(freqs, samples.flow, samples.sample_rate // 2)
+match = MatchedFilter(freqs, training_samples.flow, training_samples.sample_rate // 2)
 
-min_param, max_param = samples.get_param_min_max(args.shift_param)
+min_param, max_param = training_samples.get_param_min_max(args.shift_param)
+val_min_param, val_max_param = validation_samples.get_param_min_max(args.shift_param)
+max_param = max(max_param, val_max_param)
 
 transform = ShiftTransform(args.shift_num, args.poly_degree,
                            args.base_time_shift,
                            args.base_freq_shift,
                            max_param,
-                           freqs, samples.flow,
-                           samples.sample_rate // 2)
+                           freqs, training_samples.flow,
+                           training_samples.sample_rate // 2)
 
 clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
 threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
@@ -184,27 +262,30 @@ out_file.attrs['base_freq_shift'] = args.base_freq_shift
 
 save_epochs = []
 save_losses = []
+save_val_losses = []
 save_checks = {t: [] for t in train.keys()}
 
 for i in range(args.epochs):
 
-    order = np.arange(samples.num)
+    order = np.arange(training_samples.num)
     if args.shuffle:
         np.random.shuffle(order)
 
-    nbatches = int(np.ceil(1. * samples.num / args.batch_size))
+    nbatches = int(np.ceil(1. * training_samples.num / args.batch_size))
 
     losses = 0.
-    times = 0.
+
     inj_chis = 0.
     inj_count = 0
     trig_snrs = 0.
     trig_count = 0
 
+    times = 0.
+
     for j in range(nbatches):
 
-        lidx = int(1. * j * samples.num / nbatches)
-        hidx = int(1. * (j + 1) * samples.num / nbatches)
+        lidx = int(1. * j * training_samples.num / nbatches)
+        hidx = int(1. * (j + 1) * training_samples.num / nbatches)
 
         idxs = order[lidx:hidx]
         idxs = np.sort(idxs)
@@ -213,76 +294,15 @@ for i in range(args.epochs):
 
         start = time.time()
 
-        segs, psds, cuts, tids, injs = samples.get_samples(idxs)
-
-        temp = np.stack([bank[tid].numpy().copy() for tid in tids])
-        gather_idxs = np.zeros((len(idxs), cuts[0, 1] - cuts[0, 0], 2), dtype=int)
-        for k, cut in enumerate(cuts):
-            gather_idxs[k, :, 0] = k
-            gather_idxs[k, :, 1] = np.arange(cut[0], cut[1])
-        param = samples.get_params(args.shift_param, idxs)
-
-        segs = tf.convert_to_tensor(segs, dtype=tf.complex64)
-        psds = tf.convert_to_tensor(psds, dtype=tf.float32)
-        temp = tf.convert_to_tensor(temp, dtype=tf.complex64)
-        injs = tf.convert_to_tensor(injs, dtype=tf.bool)
-        gather_idxs = tf.convert_to_tensor(gather_idxs, dtype=tf.int64)
-    
-        param = tf.convert_to_tensor(param, dtype=tf.float32)
+        segs, psds, temp, injs, gather_idxs, param = training_samples.get_tensors(idxs, bank,
+                                                                                  args.shift_param)
 
         logging.info("Batch inputs read")
 
         with tf.GradientTape() as tape:
 
-            chi_temps = transform.transform(temp, param)
-            #chi_temps = transform.transform(temp)
-            logging.info("Templates transformed")
-
-            chi_orthos, ortho_lgc =  transform.get_ortho(chi_temps, temp, psds)
-            logging.info("Orthogonal templates created")
-
-            snrs, _ = match.matched_filter(temp, segs, psds)
-
-            snr = snrs[:, 0, :]
-
-            snr_cut = tf.gather_nd(snr, gather_idxs)
-            max_snr = tf.math.argmax(snr_cut, axis=-1)
-
-            idx = max_snr + gather_idxs[:, 0, 1]
-            gather_max = tf.stack([tf.range(len(idxs), dtype=tf.int64), idx], axis=-1)
-
-            snr_max = tf.gather_nd(snr, gather_max)
-
-            chis, match_lgc = match.matched_filter(chi_orthos, segs, psds, idx=idx)
-
-            lgc = tf.math.logical_and(ortho_lgc, match_lgc)
-            mask = tf.cast(lgc, tf.float32)[:, :, 0]
-            ortho_num = tf.reduce_sum(mask, axis=1)
-
-            chis = chis * tf.stop_gradient(mask)
-
-            logging.info("SNRs calculated")
-
-            chisq = tf.math.reduce_sum(chis ** 2., axis=1)
-            rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
-
-            chisq_thresh = rchisq / threshold
-            chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
-
-            snr_prime = snr_max / chisq_thresh ** 0.5
-
-            logging.info("SNR' calculated")
-
-            #trig_loss = - chi2(snr_prime ** 2., 2.)
-            #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
-            above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
-            trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
-            inj_loss = chisq_thresh ** 0.5
-
-            batch_loss = tf.where(injs, inj_loss, trig_loss)
-
+            batch_loss = batch(segs, psds, temp, injs, gather_idxs, param)
             loss = tf.reduce_mean(batch_loss)
-
             logging.info("Loss calculated")
 
         gradients = tape.gradient(loss, trainable_weights, unconnected_gradients='none')
@@ -292,24 +312,26 @@ for i in range(args.epochs):
         logging.info("Gradients applied")
         logging.info("Completed batch")
 
-        duration = time.time() - start
         losses += loss
-        times += duration
+
         inj_lgc = injs.numpy()
         trig_lgc = np.logical_not(inj_lgc)
-        inj_chis += np.sum(inj_loss.numpy()[inj_lgc])
+        inj_chis += np.sum(batch_loss.numpy()[inj_lgc])
         inj_count += np.sum(inj_lgc)
-        trig_snrs += np.sum(trig_loss.numpy()[trig_lgc])
+        trig_snrs += np.sum(batch_loss.numpy()[trig_lgc])
         trig_count += np.sum(trig_lgc)
+
+        times += time.time() - start
 
         if j == (nbatches - 1):
             end_str = '\n'
         else:
             end_str = '\r'
         print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
-              + "Av. Loss: {0:6.6f}, Av. Time: {1:6.2f}, ".format(losses / (j + 1), times / (j + 1))
+              + "Av. Loss: {0:6.6f}, ".format(losses / (j + 1))
               + "Av. Inj Div: {0:6.6f}, ".format(inj_chis / inj_count)
-              + "Av. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count),
+              + "Av. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count)
+              + "Av. Time: {0:6.2f}".format(times / (j + 1)),
               end=end_str)
 
     save_losses += [losses / nbatches]
@@ -319,7 +341,67 @@ for i in range(args.epochs):
         for k, v in zip(trainable_names, trainable_weights):
             save_checks[k] += [v.numpy()]
 
+    order = np.arange(training_samples.num)
+    nbatches = int(np.ceil(1. * validation_samples.num / args.batch_size))
+
+    losses = 0.
+
+    inj_chis = 0.
+    inj_count = 0
+    trig_snrs = 0.
+    trig_count = 0
+
+    times = 0.
+
+    for j in range(nbatches):
+
+        lidx = int(1. * j * validation_samples.num / nbatches)
+        hidx = int(1. * (j + 1) * validation_samples.num / nbatches)
+
+        idxs = order[lidx:hidx]
+        idxs = np.sort(idxs)
+
+        logging.info("Starting batch")
+
+        start = time.time()
+
+        segs, psds, temp, injs, gather_idxs, param = validation_samples.get_tensors(idxs, bank,
+                                                                                    args.shift_param)
+
+        logging.info("Batch inputs read")
+
+        batch_loss = batch(segs, psds, temp, injs, gather_idxs, param)
+        loss = tf.reduce_mean(batch_loss)
+        logging.info("Loss calculated")
+        logging.info("Completed batch")
+
+        losses += loss
+
+        inj_lgc = injs.numpy()
+        trig_lgc = np.logical_not(inj_lgc)
+        inj_chis += np.sum(batch_loss.numpy()[inj_lgc])
+        inj_count += np.sum(inj_lgc)
+        trig_snrs += np.sum(batch_loss.numpy()[trig_lgc])
+        trig_count += np.sum(trig_lgc)
+
+        times += time.time() - start
+
+        if j == (nbatches - 1):
+            end_str = '\n'
+        else:
+            end_str = '\r'
+        print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
+              + "Av. Val. Loss: {0:6.6f}, ".format(losses / (j + 1))
+              + "Av. Val. Inj Div: {0:6.6f}, ".format(inj_chis / inj_count)
+              + "Av. Val. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count)
+              + "Av. Val. Time: {0:6.2f}".format(times / (j + 1)),
+              end=end_str)
+
+    save_val_losses += [losses / nbatches]
+
+
 _ = out_file.create_dataset('loss', data=np.array(save_losses))
+_ = out_file.create_dataset('validation_loss', data=np.array(save_val_losses))
 
 _ = out_file.create_dataset('epoch', data=np.array(save_epochs))
 for k, v in save_checks.items():

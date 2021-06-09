@@ -26,8 +26,10 @@ setuptools.setup(
              "bin/make_preprocessing_workflow",
              "bin/preprocess_strain",
              "bin/merge_samples",
+             "bin/prepare_samples",
              "bin/manual_stageout",
              "bin/train_model",
+             "bin/page_sample_table",
              "bin/plot_loss",
              "bin/plot_shifts"],
     classifiers=[

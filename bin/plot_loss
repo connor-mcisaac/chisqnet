@@ -20,15 +20,18 @@ args = parser.parse_args()
 
 with h5py.File(args.input_file, 'r') as f:
      losses = f['loss'][:]
+     val_losses = f['validation_loss'][:]
 
 caption = "This is a plot of the loss as it evolves with " \
 	  "the number of epochs of training."
 
 fig, ax = plt.subplots(figsize=(8, 6))
-ax.plot(losses, linewidth=3)
+ax.plot(losses, linewidth=3, label='loss', alpha=0.75)
+ax.plot(val_losses, linewidth=3, label='validation loss', alpha=0.75)
 ax.set_xlabel('Epochs', fontsize='large')
 ax.set_ylabel('Loss', fontsize='large')
 ax.grid()
+ax.legend()
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
      title='Loss vs. Epochs',
      caption=caption,

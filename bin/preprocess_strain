@@ -70,6 +70,8 @@ if path != '':
 
 with h5py.File(args.output_file, 'w') as f:
 
+    group = f.create_group(args.ifo)
+
     stildes = []
     psds = []
     cuts = []
@@ -114,10 +116,10 @@ with h5py.File(args.output_file, 'w') as f:
         if len(stildes) > args.extend_num:
             logging.info("Writing to file")
             if "stilde" not in f.keys():
-                stilde_group = f.create_dataset("stilde", (len(stildes), flen), dtype='c8',
-                                                chunks=(args.chunk_num, flen), maxshape=(None, flen))
-                psd_group = f.create_dataset("psd", (len(stildes), flen), dtype='f4',
-                                             chunks=(args.chunk_num, flen), maxshape=(None, flen))
+                stilde_group = group.create_dataset("stilde", (len(stildes), flen), dtype='c8',
+                                                    chunks=(args.chunk_num, flen), maxshape=(None, flen))
+                psd_group = group.create_dataset("psd", (len(stildes), flen), dtype='f4',
+                                                 chunks=(args.chunk_num, flen), maxshape=(None, flen))
             else:
                 stilde_group.resize(stilde_group.len() + len(stildes), axis=0)
                 psd_group.resize(psd_group.len() + len(psds), axis=0)
@@ -131,10 +133,10 @@ with h5py.File(args.output_file, 'w') as f:
     if len(stildes) > 0:
         logging.info("Writing to file")
         if "stilde" not in f.keys():
-            stilde_group = f.create_dataset("stilde", (len(stildes), flen), dtype='c8',
-                                            chunks=(args.chunk_num, flen), maxshape=(None, flen))
-            psd_group = f.create_dataset("psd", (len(stildes), flen), dtype='f4',
-                                         chunks=(args.chunk_num, flen), maxshape=(None, flen))
+            stilde_group = group.create_dataset("stilde", (len(stildes), flen), dtype='c8',
+                                                chunks=(args.chunk_num, flen), maxshape=(None, flen))
+            psd_group = group.create_dataset("psd", (len(stildes), flen), dtype='f4',
+                                             chunks=(args.chunk_num, flen), maxshape=(None, flen))
         else:
             stilde_group.resize(stilde_group.len() + len(stildes), axis=0)
             psd_group.resize(psd_group.len() + len(psds), axis=0)
@@ -146,15 +148,14 @@ with h5py.File(args.output_file, 'w') as f:
     cuts = np.stack(cuts)
     samps = np.stack(samps)
 
-    cut_group = f.create_dataset("cut", data=cuts)
+    cut_group = group.create_dataset("cut", data=cuts)
     
     for p, d in zip(samples._params, samples._dtypes):
         data = samps[p][:]
         if d.startswith('U'):
             data = data.astype('S')
-        _ = f.create_dataset(p, data=data)
+        _ = group.create_dataset(p, data=data)
     
-    _ = f.create_dataset('ifo', data=samps['ifo'][:].astype('S'))
     f.attrs['flow'] = args.low_frequency_cutoff
     f.attrs['flen'] = flen
     f.attrs['delta_f'] = delta_f

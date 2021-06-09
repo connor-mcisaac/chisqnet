@@ -19,7 +19,7 @@ class FilterTriggersExecutable(Executable):
         if veto_file is not None:
             node.add_input_opt('--veto-files', veto_file)
         seg = single_det_files.get_times_covered_by_files()
-        node.new_output_file_opt(seg, '.hdf', '--output-file', tags=[])
+        node.new_output_file_opt(seg, '.hdf', '--output-file')
         return node
 
 
@@ -241,7 +241,7 @@ def sngl_ifo_job_setup(workflow, ifo, out_files, curr_exe_job, science_segs,
 class MergeSamplesExecutable(Executable):
     
     current_retention_level = Executable.MERGED_TRIGGERS
-    def create_node(self, samples, output=None):
+    def create_node(self, samples, output=None, create_bank=False):
         node = Node(self)
         seg = samples.get_times_covered_by_files()
         node.add_input_list_opt('--sample-files', samples)
@@ -257,28 +257,36 @@ class MergeSamplesExecutable(Executable):
                     out_file.storage_path = output
             node.add_output_opt('--output-file', out_file)
         else:
-            node.new_output_file_opt(seg, '.hdf', '--output-file')
+            node.new_output_file_opt(seg, '.hdf', '--output-file', tags=['SAMPLES'])
+
+        if create_bank:
+            node.new_output_file_opt(seg, '.hdf', '--bank-file', tags=['BANK'])
+
+        return node
+
+
+class PrepareSamplesExecutable(Executable):
+    
+    current_retention_level = Executable.MERGED_TRIGGERS
+    def create_node(self, samples):
+        node = Node(self)
+        node.add_input_opt('--sample-file', samples)
+        node.new_output_file_opt(samples.segment, '.hdf', '--training-file', tags=['TRAINING'])
+        node.new_output_file_opt(samples.segment, '.hdf', '--validation-file', tags=['VALIDATION'])
         return node
 
 
 class TrainingExecutable(Executable):
     
     current_retention_level = Executable.MERGED_TRIGGERS
-    def create_node(self, samples, bank):
+    def create_node(self, training_samples, validation_samples, bank):
         node = Node(self)
-        node.add_input_opt('--sample-file', samples)
+        node.add_input_opt('--training-sample-file', training_samples)
+        node.add_input_opt('--validation-sample-file', validation_samples)
         node.add_input_opt('--bank-file', bank)
-        node.new_output_file_opt(samples.segment, '.hdf', '--output-file')
+        node.new_output_file_opt(training_samples.segment, '.hdf', '--output-file')
         return node
 
-class PlotExecutable(Executable):
-    
-    current_retention_level = Executable.FINAL_RESULT
-    def create_node(self, infile):
-        node = Node(self)
-        node.add_input_opt('--input-file', infile)
-        node.new_output_file_opt(infile.segment, '.png', '--output-file')
-        return node
 
 class StageoutExecutable(Executable):
     
