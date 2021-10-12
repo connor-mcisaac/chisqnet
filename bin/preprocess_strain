@@ -115,7 +115,7 @@ with h5py.File(args.output_file, 'w') as f:
 
         if len(stildes) > args.extend_num:
             logging.info("Writing to file")
-            if "stilde" not in f.keys():
+            if "stilde" not in group.keys():
                 stilde_group = group.create_dataset("stilde", (len(stildes), flen), dtype='c8',
                                                     chunks=(args.chunk_num, flen), maxshape=(None, flen))
                 psd_group = group.create_dataset("psd", (len(stildes), flen), dtype='f4',
@@ -132,7 +132,7 @@ with h5py.File(args.output_file, 'w') as f:
 
     if len(stildes) > 0:
         logging.info("Writing to file")
-        if "stilde" not in f.keys():
+        if "stilde" not in group.keys():
             stilde_group = group.create_dataset("stilde", (len(stildes), flen), dtype='c8',
                                                 chunks=(args.chunk_num, flen), maxshape=(None, flen))
             psd_group = group.create_dataset("psd", (len(stildes), flen), dtype='f4',
