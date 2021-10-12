@@ -206,10 +206,10 @@ class ShiftTransform(BaseTransform):
         
         params = tf.math.pow(param, power)
         params_max = tf.math.pow(param_max, power)
-        scale = params / params_max
+        scale = self.dt * params / params_max / (self.degree + 1)
 
         terms = dts * scale
-        dt = tf.math.reduce_sum(terms, axis=2) * self.dt / (self.degree + 1)
+        dt = tf.math.reduce_sum(terms, axis=2)
 
         return dt
 
@@ -227,9 +227,10 @@ class ShiftTransform(BaseTransform):
         
         params = tf.math.pow(param, power)
         params_max = tf.math.pow(param_max, power)
+        scale = self.df * params / params_max / (self.degree + 1)
 
-        terms = dfs * params / params_max
-        df = tf.math.reduce_sum(terms, axis=2) * self.df / (self.degree + 1)
+        terms = dfs * scale
+        df = tf.math.reduce_sum(terms, axis=2)
 
         return df
 
@@ -315,6 +316,46 @@ class ShiftTransform(BaseTransform):
         df = self.get_df(param)
         temp = self.shift_df(temp, df)
         return temp
+
+    def get_weights(self):
+        
+        power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float32)
+        
+        param_max = tf.ones_like(power) * self.param_max
+        param_max = tf.math.pow(param_max, power)
+        scale = 1. / param_max / (self.degree + 1)
+
+        weights = {'dt': self.dt_base * self.dt * scale,
+                   'df': self.df_base * self.df * scale}
+        return weights
+
+    @classmethod
+    def from_weights(cls, dt_weights, df_weights,
+                     dt, df, param_max,
+                     freqs, f_low, f_high, offset=None):
+
+        nshifts = dt_weights.shape[0]
+        degree = dt_weights.shape[1] - 1
+
+        obj = cls(nshifts, degree, dt, df, param_max,
+                  freqs, f_low, f_high, offset=offset)
+
+        dt_weights = tf.Variable(dt_weights, trainable=True, dtype=tf.float32)
+        df_weights = tf.Variable(df_weights, trainable=True, dtype=tf.float32)
+
+        power = tf.range(0, obj.degree + 1, delta=1., dtype=tf.float32)
+        
+        param_max = tf.ones_like(power) * obj.param_max
+        param_max = tf.math.pow(param_max, power)
+        scale = 1. / param_max / (obj.degree + 1)
+        scale = tf.expand_dims(scale, axis=0)
+
+        obj.dt_base = dt_weights / obj.dt / scale
+        obj.df_base = df_weights / obj.df / scale
+
+        obj.trainable_weights = {'dt': obj.dt_base, 'df': obj.df_base}
+
+        return obj
 
 
 class Convolution1DTransform(BaseTransform):

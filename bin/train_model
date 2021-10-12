@@ -338,8 +338,10 @@ for i in range(args.epochs):
 
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
         save_epochs += [i + 1]
-        for k, v in zip(trainable_names, trainable_weights):
+        save_weights = transform.get_weights()
+        for k, v in save_weights.items():
             save_checks[k] += [v.numpy()]
+        save_checks['thresh'] += [threshold.numpy()]
 
     order = np.arange(training_samples.num)
     nbatches = int(np.ceil(1. * validation_samples.num / args.batch_size))
