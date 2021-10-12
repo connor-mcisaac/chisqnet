@@ -20,16 +20,6 @@ parser.add_argument("--input-file", required=True,
 parser.add_argument("--output-file", required=True,
                     help="Location of the output file")
 
-parser.add_argument("--shift-num", default=8, type=int,
-                    help="The number of shift transformations to train")
-parser.add_argument("--poly-degree", default=2, type=int,
-                    help="The degree of the polynomial use in the shift transformations")
-parser.add_argument("--base-time-shift", default=0.01, type=float,
-                    help="The maximum time shift that can be caused by a single term in "
-                         "the polynomial.")
-parser.add_argument("--base-freq-shift", default=10., type=float,
-                    help="The maximum frequency shift that can be caused by a single term in "
-                         "the polynomial.")
 parser.add_argument("--shift-param", default="mtotal", type=str,
                     help="The parameter used to calculate the time and frequency shifts")
 parser.add_argument("--min-param", default=100, type=float,
@@ -44,14 +34,10 @@ with h5py.File(args.input_file, 'r') as f:
      dts = tf.convert_to_tensor(f['dt'][-1, :, :])
      thresh = f['thresh'][-1, 0]
 
-transform = ShiftTransform(args.shift_num, args.poly_degree,
-                           args.base_time_shift,
-                           args.base_freq_shift,
-                           args.max_param,
-                           np.arange(10), 1., 10)
-
-transform.df_base = dfs
-transform.dt_base = dts
+transform = ShiftTransform.from_weights(dts, dfs,
+                                        1., 1.,
+                                        args.max_param,
+                                        np.arange(10), 1., 10.)
 
 params = tf.Variable(np.linspace(args.min_param, args.max_param, num=100, endpoint=True),
                      dtype=tf.float32)
@@ -64,7 +50,7 @@ caption = "This is a plot of the time and frequency shifts " \
 
 fig, ax = plt.subplots(figsize=(8, 6))
 
-for i in range(args.shift_num):
+for i in range(transform.nshifts):
     sc = ax.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool")
 
 ax.set_title("threshold = {0:.4f}".format(thresh), fontsize="large")
