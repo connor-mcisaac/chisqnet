@@ -5,7 +5,7 @@ Script for creating a workflow to prepare a training set and train a model
 for chi-squared discriminators.
 """
 
-import os, argparse, logging, sys, socket
+import os, argparse, logging, sys, socket, numpy
 import pycbc.workflow as wf
 from Pegasus import DAX3 as dax
 from pycbc.results import layout, create_versioning_page
@@ -14,7 +14,8 @@ from ligo import segments
 from pycbc.workflow import PlotExecutable
 from chisqnet.workflow import (FilterTriggersExecutable, PreprocessingDaxGenerator,
                                MergeSamplesExecutable, StageoutExecutable,
-                               PrepareSamplesExecutable, TrainingExecutable)
+                               PrepareSamplesExecutable, TrainingExecutable,
+                               ValidationExecutable, MergeModelsExecutable)
 
 
 # Log to the screen until we know where the output file is
@@ -263,14 +264,55 @@ workflow.add_node(node)
 training_samples = node.output_files[0]
 validation_samples = node.output_files[1]
 
-# Setup training job
-logging.info("Setting up training job")
+# Setup training and validation jobs
+epochs_total = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-total", []))
+epochs_per = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-per-job", []))
+epochs_per = min(epochs_total, epochs_per)
+
+logging.info("Setting up training jobs")
 training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
+                                  ifos=workflow.ifos, tags=['EPOCHS', '0', str(epochs_per)])
+node = training_job.create_node(epochs_per, training_samples, bank_file)
+workflow.add_node(node)
+checkpoint_files = [node.output_files[0]]
+
+validation_job = ValidationExecutable(workflow.cp, 'validate-model', out_dir='trained_model',
+                                      ifos=workflow.ifos, tags=['EPOCHS', '0', str(epochs_per)])
+node = validation_job.create_node(validation_samples, bank_file, checkpoint_files[-1])
+workflow.add_node(node)
+validation_files = [node.output_files[0]]
+
+epochs_done = epochs_per
+while epochs_done < epochs_total:
+    epochs_left = epochs_total - epochs_done
+    epochs_next = min(epochs_per, epochs_left)
+
+    training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
+                                      ifos=workflow.ifos,
+                                      tags=['EPOCHS', str(epochs_done), str(epochs_next)])
+    node = training_job.create_node(epochs_per, training_samples, bank_file,
+                                    checkpoint=checkpoint_files[-1])
+    workflow.add_node(node)
+    checkpoint_files += [node.output_files[0]]
+
+    validation_job = ValidationExecutable(workflow.cp, 'validate-model', out_dir='trained_model',
+                                          ifos=workflow.ifos,
+                                          tags=['EPOCHS', str(epochs_done), str(epochs_next)])
+    node = validation_job.create_node(validation_samples, bank_file, checkpoint_files[-1])
+    workflow.add_node(node)
+    validation_files += [node.output_files[0]]
+
+    epochs_done += epochs_next
+
+logging.info("Training job setup")
+
+# Merge training and validation files
+logging.info("Setting up output file merging")
+merge_job = MergeModelsExecutable(workflow.cp, 'merge-models', out_dir='trained_model',
                                   ifos=workflow.ifos, tags=[])
-node = training_job.create_node(training_samples, validation_samples, bank_file)
+node = merge_job.create_node(wf.FileList(checkpoint_files + validation_files))
 workflow.add_node(node)
 trained_model = node.output_files[0]
-logging.info("Training job setup")
 
 # Setup plotting jobs
 logging.info("Setting up plotting jobs")

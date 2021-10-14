@@ -388,10 +388,14 @@ class DataCollector(object):
     def __call__(self, name, node):
         if not isinstance(node, h5py.Dataset):
             pass
+        dataset = node[()]
+        dtype = type(dataset)
+        if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating):
+            dataset = np.array([dataset])
         elif name not in self.datasets.keys():
-            self.datasets[name] = [node[:]]
+            self.datasets[name] = [dataset]
         else:
-            self.datasets[name].append(node[:])
+            self.datasets[name].append(dataset)
 
     def concatenate_datasets(self):
         for k, v in self.datasets.items():

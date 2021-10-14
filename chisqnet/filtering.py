@@ -340,8 +340,8 @@ class ShiftTransform(BaseTransform):
         obj = cls(nshifts, degree, dt, df, param_max,
                   freqs, f_low, f_high, offset=offset)
 
-        dt_weights = tf.Variable(dt_weights, trainable=True, dtype=tf.float32)
-        df_weights = tf.Variable(df_weights, trainable=True, dtype=tf.float32)
+        dt_weights = tf.convert_to_tensor(dt_weights, dtype=tf.float32)
+        df_weights = tf.convert_to_tensor(df_weights, dtype=tf.float32)
 
         power = tf.range(0, obj.degree + 1, delta=1., dtype=tf.float32)
         
@@ -350,8 +350,8 @@ class ShiftTransform(BaseTransform):
         scale = 1. / param_max / (obj.degree + 1)
         scale = tf.expand_dims(scale, axis=0)
 
-        obj.dt_base = dt_weights / obj.dt / scale
-        obj.df_base = df_weights / obj.df / scale
+        obj.dt_base = tf.Variable(dt_weights / obj.dt / scale, trainable=True, dtype=tf.float32)
+        obj.df_base = tf.Variable(df_weights / obj.df / scale, trainable=True, dtype=tf.float32)
 
         obj.trainable_weights = {'dt': obj.dt_base, 'df': obj.df_base}
 

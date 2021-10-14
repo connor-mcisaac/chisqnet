@@ -29,6 +29,8 @@ setuptools.setup(
              "bin/prepare_samples",
              "bin/manual_stageout",
              "bin/train_model",
+             "bin/validate_model",
+             "bin/merge_models",
              "bin/page_sample_table",
              "bin/plot_loss",
              "bin/plot_shifts"],

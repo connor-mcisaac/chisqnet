@@ -19,15 +19,17 @@ parser.add_argument("--output-file", required=True,
 args = parser.parse_args()
 
 with h5py.File(args.input_file, 'r') as f:
-     losses = f['loss'][:]
-     val_losses = f['validation_loss'][:]
+     train_epoch = f['loss_epoch'][:]
+     train_loss = f['loss'][:]
+     val_epoch = f['validation_epoch'][:]
+     val_loss = f['validation_loss'][:]
 
 caption = "This is a plot of the loss as it evolves with " \
 	  "the number of epochs of training."
 
 fig, ax = plt.subplots(figsize=(8, 6))
-ax.plot(losses, linewidth=3, label='loss', alpha=0.75)
-ax.plot(val_losses, linewidth=3, label='validation loss', alpha=0.75)
+ax.plot(train_epoch, train_loss, linewidth=3, label='loss', alpha=0.75)
+ax.plot(val_epoch, val_loss, linewidth=3, label='validation loss', alpha=0.75)
 ax.set_xlabel('Epochs', fontsize='large')
 ax.set_ylabel('Loss', fontsize='large')
 ax.grid()

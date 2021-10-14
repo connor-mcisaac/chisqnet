@@ -1,0 +1,55 @@
+#! /usr/bin/env python
+
+import argparse
+import logging
+import h5py
+import numpy as np
+from chisqnet.preprocessing import DataCollector, AttributeCollector
+
+
+parser = argparse.ArgumentParser()
+
+# Gather inputs from preprocessing step
+parser.add_argument("--model-files", nargs='+', required=True,
+                    help="List of model files")
+
+# Gather output options
+parser.add_argument("--output-file", required=True,
+                    help="Output location")
+
+# Gather additional options
+parser.add_argument("--verbose", action='store_true')
+
+args = parser.parse_args()
+
+if args.verbose:
+    log_level = logging.DEBUG
+else:
+    log_level = logging.WARNING
+logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
+
+logging.info("Reading and combining sample files")
+
+file_attrs = AttributeCollector()
+file_data = DataCollector()
+
+for fp in args.model_files:
+    with h5py.File(fp, 'r') as f:
+        file_attrs(f)
+        f.visititems(file_data)
+
+file_data.concatenate_datasets()
+
+with h5py.File(args.output_file, 'w') as f:
+    
+    for k, v in file_attrs.attrs.items():
+        if k.startswith('optimizer'):
+            continue
+        f.attrs[k] = v
+
+    for k, v in file_data.datasets.items():
+        if k.startswith('optimizer'):
+            continue
+        _ = f.create_dataset(k, data=v)    
+
+logging.info("Done!")
