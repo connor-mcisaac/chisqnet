@@ -4,7 +4,7 @@ import sys
 import argparse
 import h5py
 import numpy as np
-from chisqnet.filtering import ShiftTransform
+from chisqnet.filtering import PolyShiftTransform
 import tensorflow as tf
 import pycbc.results
 import matplotlib
@@ -34,10 +34,10 @@ with h5py.File(args.input_file, 'r') as f:
      dts = tf.convert_to_tensor(f['dt'][-1, :, :])
      thresh = f['thresh'][-1, 0]
 
-transform = ShiftTransform.from_weights(dts, dfs,
-                                        1., 1.,
-                                        args.max_param,
-                                        np.arange(10), 1., 10.)
+transform = PolyShiftTransform.from_weights(dts, dfs,
+                                            1., 1.,
+                                            args.max_param,
+                                            np.arange(10), 1., 10.)
 
 params = tf.Variable(np.linspace(args.min_param, args.max_param, num=100, endpoint=True),
                      dtype=tf.float32)

@@ -6,13 +6,13 @@ import h5py
 import numpy as np
 from pycbc import waveform
 from pycbc.types import zeros, float32, complex64
-from chisqnet.filtering import MatchedFilter, ShiftTransform
+from chisqnet.filtering import ChisqFilter, PolyShiftTransform
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from chisqnet.training_utils import SampleFile, chi2, nc_chi2, batch
+from chisqnet.training_utils import SampleFile, chi2, nc_chi2
 
 
 parser = argparse.ArgumentParser()
@@ -107,19 +107,17 @@ bank = waveform.FilterBank(args.bank_file, samples.flen, samples.delta_f,
 
 freqs = np.arange(samples.flen) * samples.delta_f
 
-match = MatchedFilter(freqs, samples.flow, samples.sample_rate // 2)
-
 min_param, max_param = samples.get_param_min_max(args.shift_param)
 clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
 
 if args.checkpoint_file is None:
     epoch = 0
-    transform = ShiftTransform(args.shift_num, args.poly_degree,
-                               args.base_time_shift,
-                               args.base_freq_shift,
-                               max_param,
-                               freqs, samples.flow,
-                               samples.sample_rate // 2)
+    transform = PolyShiftTransform(args.shift_num, args.poly_degree,
+                                   args.base_time_shift,
+                                   args.base_freq_shift,
+                                   max_param,
+                                   freqs, samples.flow,
+                                   samples.sample_rate // 2)
 
     threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
                             dtype=tf.float32, constraint=clip)
@@ -133,15 +131,18 @@ else:
         opt_weights = [f['optimizer_weights_{0}'.format(i)][()]
                        for i in range(f.attrs['optimizer_weights_num'])]
 
-    transform = ShiftTransform.from_weights(dts, dfs,
-                                            args.base_time_shift,
-                                            args.base_freq_shift,
-                                            max_param,
-                                            freqs, samples.flow,
-                                            samples.sample_rate // 2)
+    transform = PolyShiftTransform.from_weights(dts, dfs,
+                                                args.base_time_shift,
+                                                args.base_freq_shift,
+                                                max_param,
+                                                freqs, samples.flow,
+                                                samples.sample_rate // 2)
     
     threshold = tf.Variable(np.array([thresh], dtype=np.float32), trainable=True,
                             dtype=tf.float32, constraint=clip)
+
+chisq_transform = ChisqFilter(transform, threshold,
+                              freqs, samples.flow, samples.sample_rate // 2)
 
 train = transform.trainable_weights
 train['thresh'] = threshold
@@ -205,8 +206,18 @@ for i in range(args.epochs):
 
         with tf.GradientTape() as tape:
 
-            batch_loss = batch(segs, psds, temp, injs, gather_idxs, param,
-                               transform, match, threshold)
+            snr_prime, chisq = chisq_transform.get_max_snr_prime(
+                temp, segs, psds, param,
+                gather_idxs=gather_idxs, max_snr=True
+            )
+
+            #trig_loss = - chi2(snr_prime ** 2., 2.)
+            #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
+            above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
+            trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
+            inj_loss = chisq ** 0.5
+
+            batch_loss = tf.where(injs, inj_loss, trig_loss)
             loss = tf.reduce_mean(batch_loss)
             logging.info("Loss calculated")
 

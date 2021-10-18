@@ -129,10 +129,13 @@ class TriggerList(object):
         self._params += names
         self._dtypes += dtypes
 
-    def threshold_cut(self, thresh, param):
+    def threshold_cut(self, thresh, param, above=True):
         
         for ifo in self.ifos:
-            lgc = self.triggers[ifo][param] > thresh
+            if above:
+                lgc = self.triggers[ifo][param] > thresh
+            else:
+                lgc = self.triggers[ifo][param] < thresh
             self.triggers[ifo] = self.triggers[ifo][lgc]
             self.nums[ifo] = np.sum(lgc)
 
@@ -387,12 +390,14 @@ class DataCollector(object):
 
     def __call__(self, name, node):
         if not isinstance(node, h5py.Dataset):
-            pass
+            return
+        
         dataset = node[()]
         dtype = type(dataset)
         if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating):
             dataset = np.array([dataset])
-        elif name not in self.datasets.keys():
+
+        if name not in self.datasets.keys():
             self.datasets[name] = [dataset]
         else:
             self.datasets[name].append(dataset)

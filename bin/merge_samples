@@ -37,6 +37,7 @@ file_attrs = AttributeCollector()
 file_data = DataCollector()
 ifos = set()
 for fp in args.sample_files:
+    logging.info("Loading file {0}".format(fp))
     with h5py.File(fp, 'r') as f:
         for ifo in f.keys():
             ifos.add(ifo)

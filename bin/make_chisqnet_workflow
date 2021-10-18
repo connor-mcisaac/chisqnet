@@ -290,7 +290,7 @@ while epochs_done < epochs_total:
     training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
                                       ifos=workflow.ifos,
                                       tags=['EPOCHS', str(epochs_done), str(epochs_next)])
-    node = training_job.create_node(epochs_per, training_samples, bank_file,
+    node = training_job.create_node(epochs_next, training_samples, bank_file,
                                     checkpoint=checkpoint_files[-1])
     workflow.add_node(node)
     checkpoint_files += [node.output_files[0]]

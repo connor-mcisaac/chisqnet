@@ -32,6 +32,12 @@ parser.add_argument("--newsnr-cut", type=float, default=0,
                     help="Threshold for removing triggers below newsnr")
 parser.add_argument("--newsnr-sg-cut", type=float, default=0,
                     help="Threshold for removing triggers below newsnr_sg")
+parser.add_argument("--snr-upper", type=float, default=0,
+                    help="Threshold for removing triggers above snr")
+parser.add_argument("--newsnr-upper", type=float, default=0,
+                    help="Threshold for removing triggers above newsnr")
+parser.add_argument("--newsnr-sg-upper", type=float, default=0,
+                    help="Threshold for removing triggers above newsnr_sg")
 parser.add_argument("--cluster-param",
                     help="Parameter to use when clustering triggers")
 parser.add_argument("--cluster-window", type=float,
@@ -82,6 +88,18 @@ if args.newsnr_cut:
 if args.newsnr_sg_cut:
     triggers.get_newsnr_sg()
     triggers.threshold_cut(args.newsnr_sg_cut, 'newsnr_sg')
+
+if args.newsnr_sg_upper:
+    triggers.threshold_cut(args.newsnr_sg_upper, 'newsnr_sg',
+                           above=False)
+
+if args.newsnr_upper:
+    triggers.threshold_cut(args.newsnr_upper, 'newsnr',
+                           above=False)
+
+if args.snr_upper:
+    triggers.threshold_cut(args.snr_upper, 'snr',
+                           above=False)
 
 logging.info("Triggers available after threshold cuts:")
 for k, v in triggers.nums.items():

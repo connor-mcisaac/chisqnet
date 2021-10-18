@@ -1,3 +1,4 @@
+import logging
 import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
@@ -165,75 +166,6 @@ class BaseTransform(BaseFilter):
 
 class ShiftTransform(BaseTransform):
 
-    def __init__(self, nshifts, degree, dt, df, param_max,
-                 freqs, f_low, f_high, offset=None):
-
-        super().__init__(freqs, f_low, f_high)
-
-        if degree < 0:
-            raise ValueError("degree must be >= 0")
-        self.nshifts = nshifts
-        self.degree = degree
-
-        self.dt = dt
-        self.df = df
-        self.param_max = param_max
-        
-        if offset is None:
-            offset = np.pi / nshifts
-
-        dt_base = np.stack([1. * np.sin(2. * np.pi * np.arange(nshifts) / nshifts + offset)
-                            for i in range(degree + 1)], axis=-1)
-        df_base = np.stack([1. * np.cos(2. * np.pi * np.arange(nshifts) / nshifts + offset)
-                            for i in range(degree + 1)], axis=-1)
-
-        self.dt_base = tf.Variable(dt_base, trainable=True, dtype=tf.float32)
-        self.df_base = tf.Variable(df_base, trainable=True, dtype=tf.float32)
-
-        self.trainable_weights = {'dt': self.dt_base, 'df': self.df_base}
-
-    def get_dt(self, param):
-        dts = tf.expand_dims(self.dt_base, 0)
-
-        param = tf.expand_dims(param, 1)
-        param = tf.expand_dims(param, 2)
-
-        param_max = tf.ones_like(param) * self.param_max
-
-        power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float32)
-        power = tf.expand_dims(power, 0)
-        power = tf.expand_dims(power, 1)
-        
-        params = tf.math.pow(param, power)
-        params_max = tf.math.pow(param_max, power)
-        scale = self.dt * params / params_max / (self.degree + 1)
-
-        terms = dts * scale
-        dt = tf.math.reduce_sum(terms, axis=2)
-
-        return dt
-
-    def get_df(self, param):
-        dfs = tf.expand_dims(self.df_base, 0)
-
-        param = tf.expand_dims(param, 1)
-        param = tf.expand_dims(param, 2)
-
-        param_max = tf.ones_like(param) * self.param_max
-
-        power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float32)
-        power = tf.expand_dims(power, 0)
-        power = tf.expand_dims(power, 1)
-        
-        params = tf.math.pow(param, power)
-        params_max = tf.math.pow(param_max, power)
-        scale = self.df * params / params_max / (self.degree + 1)
-
-        terms = dfs * scale
-        df = tf.math.reduce_sum(terms, axis=2)
-
-        return df
-
     def shift_dt(self, temp, dt):
 
         dt = tf.expand_dims(dt, 2)
@@ -316,6 +248,78 @@ class ShiftTransform(BaseTransform):
         df = self.get_df(param)
         temp = self.shift_df(temp, df)
         return temp
+
+
+class PolyShiftTransform(ShiftTransform):
+
+    def __init__(self, nshifts, degree, dt, df, param_max,
+                 freqs, f_low, f_high, offset=None):
+
+        super().__init__(freqs, f_low, f_high)
+
+        if degree < 0:
+            raise ValueError("degree must be >= 0")
+        self.nshifts = nshifts
+        self.degree = degree
+
+        self.dt = dt
+        self.df = df
+        self.param_max = param_max
+        
+        if offset is None:
+            offset = np.pi / nshifts
+
+        dt_base = np.stack([1. * np.sin(2. * np.pi * np.arange(nshifts) / nshifts + offset)
+                            for i in range(degree + 1)], axis=-1)
+        df_base = np.stack([1. * np.cos(2. * np.pi * np.arange(nshifts) / nshifts + offset)
+                            for i in range(degree + 1)], axis=-1)
+
+        self.dt_base = tf.Variable(dt_base, trainable=True, dtype=tf.float32)
+        self.df_base = tf.Variable(df_base, trainable=True, dtype=tf.float32)
+
+        self.trainable_weights = {'dt': self.dt_base, 'df': self.df_base}
+
+    def get_dt(self, param):
+        dts = tf.expand_dims(self.dt_base, 0)
+
+        param = tf.expand_dims(param, 1)
+        param = tf.expand_dims(param, 2)
+
+        param_max = tf.ones_like(param) * self.param_max
+
+        power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float32)
+        power = tf.expand_dims(power, 0)
+        power = tf.expand_dims(power, 1)
+        
+        params = tf.math.pow(param, power)
+        params_max = tf.math.pow(param_max, power)
+        scale = self.dt * params / params_max / (self.degree + 1)
+
+        terms = dts * scale
+        dt = tf.math.reduce_sum(terms, axis=2)
+
+        return dt
+
+    def get_df(self, param):
+        dfs = tf.expand_dims(self.df_base, 0)
+
+        param = tf.expand_dims(param, 1)
+        param = tf.expand_dims(param, 2)
+
+        param_max = tf.ones_like(param) * self.param_max
+
+        power = tf.range(0, self.degree + 1, delta=1., dtype=tf.float32)
+        power = tf.expand_dims(power, 0)
+        power = tf.expand_dims(power, 1)
+        
+        params = tf.math.pow(param, power)
+        params_max = tf.math.pow(param_max, power)
+        scale = self.df * params / params_max / (self.degree + 1)
+
+        terms = dfs * scale
+        df = tf.math.reduce_sum(terms, axis=2)
+
+        return df
 
     def get_weights(self):
         
@@ -436,3 +440,71 @@ class Convolution1DTransform(BaseTransform):
         temp = self.convolve(temp)
         temp = self.shift_dt(temp)
         return temp
+
+
+class ChisqFilter(MatchedFilter):
+
+    def __init__(self, transform, threshold, freqs, f_low, f_high):
+        super().__init__(freqs, f_low, f_high)
+        self.transform = transform
+        self.threshold = threshold
+
+    def get_max_idx(self, data, gather_idxs=None):
+        if gather_idxs is not None:
+            data = tf.gather_nd(data, gather_idxs)
+        max_data_idx = tf.math.argmax(data, axis=-1)
+
+        max_data_gather = tf.stack([tf.range(tf.shape(max_data_idx)[0], dtype=tf.int64),
+                                    max_data_idx], axis=-1)
+
+        if gather_idxs is not None:
+            max_data_idx = max_data_idx + gather_idxs[:, 0, 1]
+
+        max_data = tf.gather_nd(data, max_data_gather)
+        return max_data, max_data_idx
+
+    def get_max_snr(self, temp, segs, psds, gather_idxs=None):
+        snr, _ = self.matched_filter(temp, segs, psds)
+        snr = snr[:, 0, :]
+        max_snr, max_snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
+        return max_snr, max_snr_idx
+
+    def get_max_snr_prime(self, temp, segs, psds, param,
+                          gather_idxs=None, max_snr=False):
+        chi_temps = self.transform.transform(temp, param)
+        logging.info("Templates transformed")
+
+        chi_orthos, ortho_lgc = self.transform.get_ortho(chi_temps, temp, psds)
+        logging.info("Orthogonal templates created")
+
+        snr, _ = self.matched_filter(temp, segs, psds)
+        snr = snr[:, 0, :]
+        snr_idx = None
+        if max_snr:
+            snr, snr_idx = self.get_max_snr(temp, segs, psds, gather_idxs=gather_idxs)
+        elif gather_idxs is not None:
+            snr = tf.gather_nd(snr, gather_idxs)
+    
+        chis, match_lgc = self.matched_filter(chi_orthos, segs, psds, idx=snr_idx)
+        if (not max_snr) and (gather_idxs is not None):
+            chis = tf.gather_nd(chis, gather_idxs)
+        
+        lgc = tf.math.logical_and(ortho_lgc, match_lgc)
+        mask = tf.cast(lgc, tf.float32)[:, :, 0]
+        ortho_num = tf.reduce_sum(mask, axis=1)
+
+        chis = chis * tf.stop_gradient(mask)
+        logging.info("SNRs calculated")
+
+        chisq = tf.math.reduce_sum(chis ** 2., axis=1)
+        rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
+
+        chisq_thresh = rchisq / self.threshold
+        chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
+
+        snr_prime = snr / chisq_thresh ** 0.5
+        if not max_snr:
+            snr_prime, _ = self.get_max_idx(snr_prime)
+        logging.info("SNR' calculated")
+
+        return snr_prime, chisq_thresh
