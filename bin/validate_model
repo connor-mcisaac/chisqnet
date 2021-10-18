@@ -1,0 +1,166 @@
+#! /usr/bin/env python
+
+import argparse
+import logging, time
+import h5py
+import numpy as np
+from pycbc import waveform
+from pycbc.types import zeros, float32, complex64
+from chisqnet.filtering import ChisqFilter, PolyShiftTransform
+import tensorflow as tf
+import tensorflow_probability as tfp
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from chisqnet.training_utils import SampleFile, chi2, nc_chi2
+
+
+parser = argparse.ArgumentParser()
+
+# Gather inputs
+parser.add_argument("--sample-file", required=True,
+                    help="Sample file to be used in training")
+parser.add_argument("--model-file",
+                    help="Model file with the the state of the "
+                         "model at each epoch to be tested")
+
+# Gather arguments for filtering/bank
+parser.add_argument("--bank-file", required=True,
+                    help="The bank file to be used to generate templates")
+parser.add_argument("--low-frequency-cutoff", type=float,
+                  help="The low frequency cutoff to use for filtering (Hz)")
+parser.add_argument("--enable-bank-start-frequency", action='store_true',
+                  help="Read the starting frequency of template waveforms"
+                       " from the template bank.")
+parser.add_argument("--max-template-length", type=float,
+                  help="The maximum length of a template is seconds. The "
+                       "starting frequency of the template is modified to "
+                       "ensure the proper length")
+waveform.bank.add_approximant_arg(parser)
+parser.add_argument("--order", type=int,
+                  help="The integer half-PN order at which to generate"
+                       " the approximant. Default is -1 which indicates to use"
+                       " approximant defined default.", default=-1,
+                       choices = np.arange(-1, 9, 1))
+taper_choices = ["start","end","startend"]
+parser.add_argument("--taper-template", choices=taper_choices,
+                    help="For time-domain approximants, taper the start and/or"
+                         " end of the waveform before FFTing.")
+
+# Gather arguments for training
+parser.add_argument("--batch-size", required=True, type=int,
+                    help="The number of samples to analyse in one batch")
+parser.add_argument("--snr-cut-width", default=0.1, type=float,
+                    help="The width around each trigger to cut from the SNR timeseries")
+
+# Gather inputs for output
+parser.add_argument("--output-file", required=True,
+                    help="The path of the output file to save the weights and losses")
+
+# Gather additional options
+parser.add_argument("--verbose", action='store_true')
+
+args = parser.parse_args()
+
+if args.verbose:
+    log_level = logging.DEBUG
+else:
+    log_level = logging.WARNING
+logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
+
+samples = SampleFile(args.sample_file)
+
+template_mem = zeros(samples.tlen, dtype=complex64)
+
+if args.enable_bank_start_frequency:
+    low_frequency_cutoff = None
+else:
+    low_frequency_cutoff = args.low_frequency_cutoff
+
+bank = waveform.FilterBank(args.bank_file, samples.flen, samples.delta_f,
+                           low_frequency_cutoff=low_frequency_cutoff,
+                           dtype=complex64, phase_order=args.order,
+                           taper=args.taper_template, approximant=args.approximant,
+                           out=template_mem, max_template_length=args.max_template_length)
+
+freqs = np.arange(samples.flen) * samples.delta_f
+
+save_epochs = []
+save_losses = []
+
+with h5py.File(args.model_file, 'r') as f:
+    epochs = f['check_epoch'][:]
+    shift_param = f.attrs['shift_param']
+    min_param, max_param = samples.get_param_min_max(shift_param)
+    
+
+out_file = h5py.File(args.output_file, 'w')
+
+for i in range(len(epochs)):
+
+    with h5py.File(args.model_file, 'r') as f:
+        dts = tf.convert_to_tensor(f['dt'][i, :, :])
+        dfs = tf.convert_to_tensor(f['df'][i, :, :])
+
+        transform = PolyShiftTransform.from_weights(dts, dfs,
+                                                    f.attrs['base_time_shift'],
+                                                    f.attrs['base_freq_shift'],
+                                                    max_param,
+                                                    freqs, samples.flow,
+                                                    samples.sample_rate // 2)
+
+        thresh = f['thresh'][i, 0]
+        threshold = tf.Variable(np.array([thresh], dtype=np.float32), trainable=False,
+                                dtype=tf.float32)
+
+    chisq_transform = ChisqFilter(transform, threshold,
+                                  freqs, samples.flow, samples.sample_rate // 2)
+
+
+    order = np.arange(samples.num)
+    nbatches = int(np.ceil(1. * samples.num / args.batch_size))
+
+    losses = 0.
+
+    for j in range(nbatches):
+
+        lidx = int(1. * j * samples.num / nbatches)
+        hidx = int(1. * (j + 1) * samples.num / nbatches)
+
+        idxs = order[lidx:hidx]
+        idxs = np.sort(idxs)
+
+        logging.info("Starting batch")
+
+        start = time.time()
+
+        segs, psds, temp, injs, gather_idxs, param = samples.get_tensors(idxs, bank,
+                                                                         shift_param)
+
+        logging.info("Batch inputs read")
+
+        snr_prime, chisq = chisq_transform.get_max_snr_prime(
+            temp, segs, psds, param,
+            gather_idxs=gather_idxs, max_snr=True
+        )
+
+        #trig_loss = - chi2(snr_prime ** 2., 2.)
+        #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
+        above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
+        trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
+        inj_loss = chisq ** 0.5
+
+        batch_loss = tf.where(injs, inj_loss, trig_loss)
+        loss = tf.reduce_mean(batch_loss)
+        logging.info("Loss calculated")
+
+        logging.info("Completed batch")
+
+        losses += loss
+
+    save_losses += [losses / nbatches]
+
+_ = out_file.create_dataset('validation_loss', data=np.array(save_losses))
+_ = out_file.create_dataset('validation_epoch', data=epochs)
+
+out_file.close()
