@@ -33,7 +33,8 @@ setuptools.setup(
              "bin/merge_models",
              "bin/page_sample_table",
              "bin/plot_loss",
-             "bin/plot_shifts"],
+             "bin/plot_model",
+             "bin/plot_per_batch"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",

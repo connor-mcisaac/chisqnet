@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 from pycbc import waveform
 from pycbc.types import zeros, float32, complex64
-from chisqnet.filtering import ChisqFilter, PolyShiftTransform
+from chisqnet.filtering import select_transformation, ChisqFilter
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
@@ -18,11 +18,13 @@ from chisqnet.training_utils import SampleFile, chi2, nc_chi2
 parser = argparse.ArgumentParser()
 
 # Gather inputs
-parser.add_argument("--sample-file", required=True,
+parser.add_argument("--training-sample-file", required=True,
+                    help="Sample file to be used in training")
+parser.add_argument("--validation-sample-file",
                     help="Sample file to be used in training")
 parser.add_argument("--checkpoint-file",
                     help="Checkpoint file with the latest state of the "
-                         "model to be laoded")
+                         "model to be loaded")
 
 # Gather arguments for filtering/bank
 parser.add_argument("--bank-file", required=True,
@@ -58,20 +60,18 @@ parser.add_argument("--snr-cut-width", default=0.1, type=float,
                     help="The width around each trigger to cut from the SNR timeseries")
 parser.add_argument("--learning-rate", default=0.001, type=float,
                     help="The learning rate passed to the training optimizer")
+parser.add_argument("--l1-weight", default=0.01, type=float,
+                    help="The l1 regulariser weight")
+parser.add_argument("--l2-weight", default=0.01, type=float,
+                    help="The l2 regulariser weight")
 
-# Gather arguments for shift transform
-parser.add_argument("--shift-num", default=8, type=int,
-                    help="The number of shift transformations to train")
-parser.add_argument("--poly-degree", default=2, type=int,
-                    help="The degree of the polynomial use in the shift transformations")
-parser.add_argument("--base-time-shift", default=0.01, type=float,
-                    help="The maximum time shift that can be caused by a single term in "
-                         "the polynomial.")
-parser.add_argument("--base-freq-shift", default=10., type=float,
-                    help="The maximum frequency shift that can be caused by a single term in "
-                         "the polynomial.")
-parser.add_argument("--shift-param", default="mtotal", type=str,
-                    help="The parameter used to calculate the time and frequency shifts")
+# Gather arguments for transform
+parser.add_argument("--transformation", required=True,
+                    help="The type of transformation to be used")
+parser.add_argument("--config-file", required=True,
+                    help="The config gile used to create the transformation")
+parser.add_argument("--threshold-max", required=True, type=float,
+                    help="The maximum value the chisquared threshold can take")
 
 # Gather inputs for output
 parser.add_argument("--output-file", required=True,
@@ -90,59 +90,64 @@ else:
     log_level = logging.WARNING
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
-samples = SampleFile(args.sample_file)
+training_samples = SampleFile(args.training_sample_file)
+if args.validation_sample_file:
+    validation_samples = SampleFile(args.validation_sample_file)
 
-template_mem = zeros(samples.tlen, dtype=complex64)
+template_mem = zeros(training_samples.tlen, dtype=complex64)
 
 if args.enable_bank_start_frequency:
     low_frequency_cutoff = None
 else:
     low_frequency_cutoff = args.low_frequency_cutoff
 
-bank = waveform.FilterBank(args.bank_file, samples.flen, samples.delta_f,
-                           low_frequency_cutoff=low_frequency_cutoff,
-                           dtype=complex64, phase_order=args.order,
-                           taper=args.taper_template, approximant=args.approximant,
-                           out=template_mem, max_template_length=args.max_template_length)
+bank = waveform.FilterBank(
+    args.bank_file, training_samples.flen, training_samples.delta_f,
+    low_frequency_cutoff=low_frequency_cutoff,
+    dtype=complex64, phase_order=args.order,
+    taper=args.taper_template, approximant=args.approximant,
+    out=template_mem, max_template_length=args.max_template_length
+)
 
-freqs = np.arange(samples.flen) * samples.delta_f
+freqs = np.arange(training_samples.flen) * training_samples.delta_f
 
-min_param, max_param = samples.get_param_min_max(args.shift_param)
-clip = lambda x: tf.clip_by_value(x, 1., args.shift_num)
+clip = lambda x: tf.clip_by_value(x, 1., args.threshold_max)
+
+transform_class = select_transformation(args.transformation)
 
 if args.checkpoint_file is None:
     epoch = 0
-    transform = PolyShiftTransform(args.shift_num, args.poly_degree,
-                                   args.base_time_shift,
-                                   args.base_freq_shift,
-                                   max_param,
-                                   freqs, samples.flow,
-                                   samples.sample_rate // 2)
+    transform = transform_class.from_config(
+        args.config_file,
+        freqs, training_samples.flow,
+        training_samples.sample_rate // 2
+    )
 
     threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
                             dtype=tf.float32, constraint=clip)
 
 else:
     with h5py.File(args.checkpoint_file, 'r') as f:
-        epoch = f['loss_epoch'][-1]
-        dfs = tf.convert_to_tensor(f['df'][-1, :, :])
-        dts = tf.convert_to_tensor(f['dt'][-1, :, :])
-        thresh = f['thresh'][-1, 0]
-        opt_weights = [f['optimizer_weights_{0}'.format(i)][()]
-                       for i in range(f.attrs['optimizer_weights_num'])]
+        epoch = f.attrs['epoch']
+        thresh = f['thresh_epoch_{0}'.format(epoch)][0]
+        g = f['optimizer_epoch_{0}'.format(epoch)]
+        opt_weights = [g['weight_{0}'.format(i)][()]
+                       for i in range(g.attrs['weights_num'])]
 
-    transform = PolyShiftTransform.from_weights(dts, dfs,
-                                                args.base_time_shift,
-                                                args.base_freq_shift,
-                                                max_param,
-                                                freqs, samples.flow,
-                                                samples.sample_rate // 2)
+    transform = transform_class.from_file(
+        args.checkpoint_file,
+        freqs, training_samples.flow,
+        training_samples.sample_rate // 2,
+        group="model_epoch_{0}".format(epoch)
+    )
     
     threshold = tf.Variable(np.array([thresh], dtype=np.float32), trainable=True,
                             dtype=tf.float32, constraint=clip)
 
-chisq_transform = ChisqFilter(transform, threshold,
-                              freqs, samples.flow, samples.sample_rate // 2)
+chisq_transform = ChisqFilter(
+    transform, threshold,
+    freqs, training_samples.flow, training_samples.sample_rate // 2
+)
 
 train = transform.trainable_weights
 train['thresh'] = threshold
@@ -158,39 +163,32 @@ if args.checkpoint_file is not None:
     optimizer.apply_gradients(zip(grads, trainable_weights))
     optimizer.set_weights(opt_weights)
 
-out_file = h5py.File(args.output_file, 'w')
-out_file.attrs['shift_num'] = args.shift_num
-out_file.attrs['poly_degree'] = args.poly_degree
-out_file.attrs['base_time_shift'] = args.base_time_shift
-out_file.attrs['base_freq_shift'] = args.base_freq_shift
-out_file.attrs['shift_param'] = args.shift_param
-
-loss_epochs = []
-save_losses = []
-check_epochs = []
-save_checks = {t: [] for t in train.keys()}
+output_file_created = False
 
 for i in range(args.epochs):
 
-    order = np.arange(samples.num)
+    logging.info("Starting epoch")
+    logging.info("Starting training")
+
+    order = np.arange(training_samples.num)
     if args.shuffle:
         np.random.shuffle(order)
 
-    nbatches = int(np.ceil(1. * samples.num / args.batch_size))
+    nbatches = int(np.ceil(1. * training_samples.num / args.batch_size))
 
-    losses = 0.
+    losses = []
 
-    inj_chis = 0.
+    inj_losses = 0.
     inj_count = 0
-    trig_snrs = 0.
+    trig_losses = 0.
     trig_count = 0
 
     times = 0.
 
     for j in range(nbatches):
 
-        lidx = int(1. * j * samples.num / nbatches)
-        hidx = int(1. * (j + 1) * samples.num / nbatches)
+        lidx = int(1. * j * training_samples.num / nbatches)
+        hidx = int(1. * (j + 1) * training_samples.num / nbatches)
 
         idxs = order[lidx:hidx]
         idxs = np.sort(idxs)
@@ -199,26 +197,41 @@ for i in range(args.epochs):
 
         start = time.time()
 
-        segs, psds, temp, injs, gather_idxs, param = samples.get_tensors(idxs, bank,
-                                                                         args.shift_param)
+        segs, psds, temp, injs, gather_idxs, params = \
+            training_samples.get_tensors(idxs, bank)
 
         logging.info("Batch inputs read")
 
         with tf.GradientTape() as tape:
 
             snr_prime, chisq = chisq_transform.get_max_snr_prime(
-                temp, segs, psds, param,
-                gather_idxs=gather_idxs, max_snr=True
+                temp, segs, psds, params,
+                gather_idxs=gather_idxs,
+                max_snr=True, training=True
             )
 
-            #trig_loss = - chi2(snr_prime ** 2., 2.)
-            #inj_loss = - nc_chi2(snr_prime ** 2., 2., snr_max ** 2.)
-            above = tf.greater(snr_prime, tf.ones_like(snr_prime) * 4.)
-            trig_loss = tf.where(above, snr_prime - 4., tf.zeros_like(snr_prime))
-            inj_loss = chisq ** 0.5
+            snr = snr_prime * (chisq ** 0.5)
+            trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.) ** 2.
+            inj_loss = (snr - snr_prime) ** 2.
 
             batch_loss = tf.where(injs, inj_loss, trig_loss)
             loss = tf.reduce_mean(batch_loss)
+
+            if args.l1_weight or args.l2_weight:
+                l1_l2_losses = []
+                for n, w in zip(trainable_names, trainable_weights):
+                    if n == 'thresh':
+                        continue
+                    l1_loss = 0.
+                    l2_loss = 0.
+                    if args.l1_weight:
+                        l1_loss = args.l1_weight * tf.reduce_sum(tf.math.abs(w)) / nbatches
+                    if args.l2_weight:
+                        l2_loss = args.l2_weight * tf.reduce_sum(tf.math.square(w)) / nbatches
+                    l1_l2_losses.append(l1_loss + l2_loss)
+                l1_l2_loss = tf.math.add_n(l1_l2_losses)
+                loss += l1_l2_loss
+                    
             logging.info("Loss calculated")
 
         gradients = tape.gradient(loss, trainable_weights, unconnected_gradients='none')
@@ -228,13 +241,13 @@ for i in range(args.epochs):
         logging.info("Gradients applied")
         logging.info("Completed batch")
 
-        losses += loss
+        losses += [loss]
 
         inj_lgc = injs.numpy()
         trig_lgc = np.logical_not(inj_lgc)
-        inj_chis += np.sum(batch_loss.numpy()[inj_lgc])
+        inj_losses += np.sum(batch_loss.numpy()[inj_lgc])
         inj_count += np.sum(inj_lgc)
-        trig_snrs += np.sum(batch_loss.numpy()[trig_lgc])
+        trig_losses += np.sum(batch_loss.numpy()[trig_lgc])
         trig_count += np.sum(trig_lgc)
 
         times += time.time() - start
@@ -243,34 +256,106 @@ for i in range(args.epochs):
             end_str = '\n'
         else:
             end_str = '\r'
-        print("Epoch: {0:5d}/{1:5d} Batch: {2:5d}/{3:5d}, ".format(i + 1, args.epochs, j + 1, nbatches)
-              + "Av. Loss: {0:6.6f}, ".format(losses / (j + 1))
-              + "Av. Inj Div: {0:6.6f}, ".format(inj_chis / inj_count)
-              + "Av. Trig SNR > 4': {0:6.6f}".format(trig_snrs / trig_count)
+
+        print("Epoch: {0:5d}/{1:5d} ".format(i + 1, args.epochs)
+              + "Batch: {0:5d}/{1:5d}, ".format(j + 1, nbatches)
+              + "Av. Loss: {0:6.6f}, ".format(np.sum(losses) / (j + 1))
+              + "Av. Inj Loss: {0:6.6f}, ".format(inj_losses / inj_count)
+              + "Av. Trig Loss: {0:6.6f}, ".format(trig_losses / trig_count)
               + "Av. Time: {0:6.2f}".format(times / (j + 1)),
               end=end_str)
 
-    loss_epochs += [epoch + i + 1]
-    save_losses += [losses / nbatches]
-
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
-        check_epochs += [epoch + i + 1]
-        save_weights = transform.get_weights()
-        for k, v in save_weights.items():
-            save_checks[k] += [v.numpy()]
-        save_checks['thresh'] += [threshold.numpy()]
+        transform.to_file(
+            args.output_file,
+            group="model_epoch_{0}".format(epoch + i + 1),
+            append=output_file_created
+        )
 
-_ = out_file.create_dataset('loss_epoch', data=np.array(loss_epochs))
-_ = out_file.create_dataset('loss', data=np.array(save_losses))
+        opt_weights = optimizer.get_weights()
+        with h5py.File(args.output_file, 'a') as f:
+            g = f.create_group('optimizer_epoch_{0}'.format(epoch + i + 1))
+            g.attrs['weights_num'] = len(opt_weights)
+            for j in range(len(opt_weights)):
+                opt = opt_weights[j]
+                _ = g.create_dataset('weight_{0}'.format(j), data=opt)
+            _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
+            _ = f.create_dataset('thresh_epoch_{0}'.format(epoch + i + 1), data=threshold.numpy())
 
-_ = out_file.create_dataset('check_epoch', data=np.array(check_epochs))
-for k, v in save_checks.items():
-    _ = out_file.create_dataset(k, data=np.stack(v, axis=0))
+        output_file_created = True
 
-opt_weights = optimizer.get_weights()
-out_file.attrs['optimizer_weights_num'] = len(opt_weights)
-for i in range(len(opt_weights)):
-    opt = opt_weights[i]
-    _ = out_file.create_dataset('optimizer_weights_{0}'.format(i), data=opt)
+    if args.validation_sample_file is None:
+        continue
 
-out_file.close()
+    logging.info("Starting validation")
+    order = np.arange(validation_samples.num)
+    nbatches = int(np.ceil(1. * validation_samples.num / args.batch_size))
+
+    losses = []
+
+    inj_losses = 0.
+    inj_count = 0
+    trig_losses = 0.
+    trig_count = 0
+
+    times = 0.
+
+    for j in range(nbatches):
+
+        lidx = int(1. * j * validation_samples.num / nbatches)
+        hidx = int(1. * (j + 1) * validation_samples.num / nbatches)
+
+        idxs = order[lidx:hidx]
+        idxs = np.sort(idxs)
+
+        logging.info("Starting batch")
+
+        start = time.time()
+
+        segs, psds, temp, injs, gather_idxs, params = \
+            validation_samples.get_tensors(idxs, bank)
+
+        logging.info("Batch inputs read")
+
+        snr_prime, chisq = chisq_transform.get_max_snr_prime(
+            temp, segs, psds, params,
+            gather_idxs=gather_idxs,
+            max_snr=True, training=False
+        )
+
+        snr = snr_prime * (chisq ** 0.5)
+        trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.) ** 2.
+        inj_loss = (snr - snr_prime) ** 2.
+
+        batch_loss = tf.where(injs, inj_loss, trig_loss)
+        loss = tf.reduce_mean(batch_loss)
+
+        logging.info("Loss calculated")
+        logging.info("Completed batch")
+
+        losses += [loss]
+
+        inj_lgc = injs.numpy()
+        trig_lgc = np.logical_not(inj_lgc)
+        inj_losses += np.sum(batch_loss.numpy()[inj_lgc])
+        inj_count += np.sum(inj_lgc)
+        trig_losses += np.sum(batch_loss.numpy()[trig_lgc])
+        trig_count += np.sum(trig_lgc)
+
+        times += time.time() - start
+
+        if j == (nbatches - 1):
+            end_str = '\n'
+        else:
+            end_str = '\r'
+
+        print("Epoch: {0:5d}/{1:5d} ".format(i + 1, args.epochs)
+              + "Batch: {0:5d}/{1:5d}, ".format(j + 1, nbatches)
+              + "Av. Loss: {0:6.6f}, ".format(np.sum(losses) / (j + 1))
+              + "Av. Inj Loss: {0:6.6f}, ".format(inj_losses / inj_count)
+              + "Av. Trig Loss: {0:6.6f}, ".format(trig_losses / trig_count)
+              + "Av. Time: {0:6.2f}".format(times / (j + 1)),
+              end=end_str)
+
+        with h5py.File(args.output_file, 'a') as f:
+            _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))

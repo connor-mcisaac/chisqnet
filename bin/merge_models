@@ -30,26 +30,43 @@ logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
 
 logging.info("Reading and combining sample files")
 
-file_attrs = AttributeCollector()
+file_attrs = AttributeCollector(check=False)
 file_data = DataCollector()
 
+epoch = 0
 for fp in args.model_files:
     with h5py.File(fp, 'r') as f:
-        file_attrs(f)
+        file_attrs.get_root(f)
+        f.visititems(file_attrs)
         f.visititems(file_data)
+        epoch = max(epoch, f.attrs['epoch'])
 
 file_data.concatenate_datasets()
+training_losses = []
+validation_losses = []
+for i in range(epochs):
+    training_losses += [file_data.datasets['training_loss_epoch_{0}'.format(i + 1)][:]]
+    validation_losses += [file_data.datasets['validation_loss_epoch_{0}'.format(i + 1)][:]]
+training_losses = np.concatenate(training_losses, axis=0)
+validation_losses = np.concatenate(validation_losses, axis=0)
 
 with h5py.File(args.output_file, 'w') as f:
     
-    for k, v in file_attrs.attrs.items():
-        if k.startswith('optimizer'):
-            continue
-        f.attrs[k] = v
+    for group, attrs in file_attrs.groups.items():
+        if group not in f:
+            g = f.create_group(group)
+        else:
+            g = f[group]
+
+        for k, v in attrs.items():
+            g.attrs[k] = v
+
+    f.attrs['epoch'] = epoch
 
     for k, v in file_data.datasets.items():
-        if k.startswith('optimizer'):
-            continue
-        _ = f.create_dataset(k, data=v)    
+        _ = f.create_dataset(k, data=v)
+
+    _ = f.create_dataset('training_loss', data=training_losses)
+    _ = f.create_dataset('validation_loss', data=validation_losses)
 
 logging.info("Done!")

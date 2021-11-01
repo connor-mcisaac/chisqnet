@@ -279,26 +279,17 @@ class PrepareSamplesExecutable(Executable):
 class TrainingExecutable(Executable):
     
     current_retention_level = Executable.ALL_TRIGGERS
-    def create_node(self, epochs, samples, bank, checkpoint=None):
+    def create_node(self, epochs, training_samples, validation_samples,
+                    bank, config, checkpoint=None):
         node = Node(self)
         node.add_opt('--epochs', epochs)
-        node.add_input_opt('--sample-file', samples)
+        node.add_input_opt('--training-sample-file', training_samples)
+        node.add_input_opt('--validation-sample-file', validation_samples)
         node.add_input_opt('--bank-file', bank)
+        node.add_input_opt('--config-file', config)
         if checkpoint is not None:
             node.add_input_opt('--checkpoint-file', checkpoint)
-        node.new_output_file_opt(samples.segment, '.hdf', '--output-file')
-        return node
-
-
-class ValidationExecutable(Executable):
-    
-    current_retention_level = Executable.ALL_TRIGGERS
-    def create_node(self, samples, bank, model):
-        node = Node(self)
-        node.add_input_opt('--sample-file', samples)
-        node.add_input_opt('--bank-file', bank)
-        node.add_input_opt('--model-file', model)
-        node.new_output_file_opt(samples.segment, '.hdf', '--output-file')
+        node.new_output_file_opt(training_samples.segment, '.hdf', '--output-file')
         return node
 
 
@@ -310,6 +301,7 @@ class StageoutExecutable(Executable):
         node.add_opt('--input-file', infile.storage_path)
         node.add_output_opt('--output-file', outfile)
         return node
+
 
 class MergeModelsExecutable(Executable):
     

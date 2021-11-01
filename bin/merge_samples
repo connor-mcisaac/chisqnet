@@ -41,7 +41,8 @@ for fp in args.sample_files:
     with h5py.File(fp, 'r') as f:
         for ifo in f.keys():
             ifos.add(ifo)
-        file_attrs(f)
+        file_attrs.get_root(f)
+        f.visititems(file_attrs)
         f.visititems(file_data)
 ifos = list(ifos)
 
@@ -93,8 +94,14 @@ logging.info("Saving combined sample file")
 
 with h5py.File(args.output_file, 'w') as f:
     
-    for k, v in file_attrs.attrs.items():
-        f.attrs[k] = v
+    for group, attrs in file_attrs.groups.items():
+        if group not in f:
+            g = f.create_group(group)
+        else:
+            g = f[group]
+
+        for k, v in attrs.items():
+            g.attrs[k] = v
 
     for k, v in file_data.datasets.items():
         _ = f.create_dataset(k, data=v)    

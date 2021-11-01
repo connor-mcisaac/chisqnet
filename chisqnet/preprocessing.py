@@ -414,12 +414,22 @@ class DataCollector(object):
 
 class AttributeCollector(object):
 
-    def __init__(self):
-        self.attrs = {}
+    def __init__(self, check=True):
+        self.groups = {}
+        self.check = check
+        
+    def __call__(self, name, node):
+        if isinstance(node, h5py.Dataset):
+            return
 
-    def __call__(self, group):
-        for k in group.attrs.keys():
-            if k not in self.attrs.keys():
-                self.attrs[k] = group.attrs[k]
-            elif np.any(self.attrs[k] != group.attrs[k]):
+        if name not in self.groups.keys():
+            self.groups[name] = {}
+        
+        for k in node.attrs.keys():
+            if k not in self.groups[name].keys():
+                self.groups[name][k] = node.attrs[k]
+            elif self.check and np.any(self.groups[name][k] != node.attrs[k]):
                 raise ValueError("Groups have different attributes")
+
+    def get_root(self, fp):
+        self.__call__('/', fp['/'])

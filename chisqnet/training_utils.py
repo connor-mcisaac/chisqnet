@@ -3,6 +3,7 @@ import h5py
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+from chisqnet.preprocessing import _bank_params, _bank_dtypes
 
 
 class SampleFile(object):
@@ -26,36 +27,47 @@ class SampleFile(object):
             injs = f['injection'][idxs]
         return segs, psds, cuts, tids, injs
 
-    def get_params(self, param, idxs):
+    def get_param(self, param, idxs):
         with h5py.File(self.fp, 'r') as f:
             if param == 'mtotal':
                 return f['mass1'][idxs] + f['mass2'][idxs]
             else:
                 return f[param][idxs]
 
+    def get_template_params(self, idxs=None):
+        if idxs is not None:
+            num = len(idxs)
+        else:
+            num = self.num
+        record = np.zeros(num, dtype={'names':_bank_params + ['mtotal'],
+                                      'formats': _bank_dtypes + ['f8']})
+        with h5py.File(self.fp, 'r') as f:
+            for p in _bank_params:
+                record[p] = f[p][idxs]
+        record['mtotal'] = record['mass1'] + record['mass2']
+        return record
+
     def get_param_min_max(self, param):
         idxs = np.arange(self.num)
         params = self.get_params(param, idxs)
         return np.min(params), np.max(params)
 
-    def get_tensors(self, idxs, bank, shift_param):
+    def get_tensors(self, idxs, bank):
         segs, psds, cuts, tids, injs = self.get_samples(idxs)
         temp = np.stack([bank[tid].numpy().copy() for tid in tids])
         gather_idxs = np.zeros((len(idxs), cuts[0, 1] - cuts[0, 0], 2), dtype=int)
         for k, cut in enumerate(cuts):
             gather_idxs[k, :, 0] = k
             gather_idxs[k, :, 1] = np.arange(cut[0], cut[1])
-        param = self.get_params(shift_param, idxs)
+        params = self.get_template_params(idxs=idxs)
 
         segs = tf.convert_to_tensor(segs, dtype=tf.complex64)
         psds = tf.convert_to_tensor(psds, dtype=tf.float32)
         temp = tf.convert_to_tensor(temp, dtype=tf.complex64)
         injs = tf.convert_to_tensor(injs, dtype=tf.bool)
         gather_idxs = tf.convert_to_tensor(gather_idxs, dtype=tf.int64)
-    
-        param = tf.convert_to_tensor(param, dtype=tf.float32)
-        
-        return segs, psds, temp, injs, gather_idxs, param
+
+        return segs, psds, temp, injs, gather_idxs, params
 
 
 def chi2(x, df):

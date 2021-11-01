@@ -15,7 +15,7 @@ from pycbc.workflow import PlotExecutable
 from chisqnet.workflow import (FilterTriggersExecutable, PreprocessingDaxGenerator,
                                MergeSamplesExecutable, StageoutExecutable,
                                PrepareSamplesExecutable, TrainingExecutable,
-                               ValidationExecutable, MergeModelsExecutable)
+                               MergeModelsExecutable)
 
 
 # Log to the screen until we know where the output file is
@@ -265,6 +265,12 @@ training_samples = node.output_files[0]
 validation_samples = node.output_files[1]
 
 # Setup training and validation jobs
+file_attrs = {'ifos': workflow.ifos,
+              'segs': training_samples.segment,
+              'tags': []}
+filestr = workflow.cp.get_opt_tags("workflow-train-model", "config-file", [])
+training_config_file = wf.resolve_url_to_file(filestr, attrs=file_attrs)
+
 epochs_total = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-total", []))
 epochs_per = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-per-job", []))
 epochs_per = min(epochs_total, epochs_per)
@@ -272,15 +278,10 @@ epochs_per = min(epochs_total, epochs_per)
 logging.info("Setting up training jobs")
 training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
                                   ifos=workflow.ifos, tags=['EPOCHS', '0', str(epochs_per)])
-node = training_job.create_node(epochs_per, training_samples, bank_file)
+node = training_job.create_node(epochs_per, training_samples, validation_samples,
+                                bank_file, training_config_file)
 workflow.add_node(node)
 checkpoint_files = [node.output_files[0]]
-
-validation_job = ValidationExecutable(workflow.cp, 'validate-model', out_dir='trained_model',
-                                      ifos=workflow.ifos, tags=['EPOCHS', '0', str(epochs_per)])
-node = validation_job.create_node(validation_samples, bank_file, checkpoint_files[-1])
-workflow.add_node(node)
-validation_files = [node.output_files[0]]
 
 epochs_done = epochs_per
 while epochs_done < epochs_total:
@@ -290,17 +291,11 @@ while epochs_done < epochs_total:
     training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
                                       ifos=workflow.ifos,
                                       tags=['EPOCHS', str(epochs_done), str(epochs_next)])
-    node = training_job.create_node(epochs_next, training_samples, bank_file,
+    node = training_job.create_node(epochs_next, training_samples, validation_samples,
+                                    bank_file, training_config_file,
                                     checkpoint=checkpoint_files[-1])
     workflow.add_node(node)
     checkpoint_files += [node.output_files[0]]
-
-    validation_job = ValidationExecutable(workflow.cp, 'validate-model', out_dir='trained_model',
-                                          ifos=workflow.ifos,
-                                          tags=['EPOCHS', str(epochs_done), str(epochs_next)])
-    node = validation_job.create_node(validation_samples, bank_file, checkpoint_files[-1])
-    workflow.add_node(node)
-    validation_files += [node.output_files[0]]
 
     epochs_done += epochs_next
 
@@ -310,7 +305,7 @@ logging.info("Training job setup")
 logging.info("Setting up output file merging")
 merge_job = MergeModelsExecutable(workflow.cp, 'merge-models', out_dir='trained_model',
                                   ifos=workflow.ifos, tags=[])
-node = merge_job.create_node(wf.FileList(checkpoint_files + validation_files))
+node = merge_job.create_node(wf.FileList(checkpoint_files))
 workflow.add_node(node)
 trained_model = node.output_files[0]
 
@@ -325,10 +320,11 @@ node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
 workflow.add_node(node)
 layout.two_column_layout(rdir['training'], [(node.output_files[0],)])
 
-shift_job = PlotExecutable(workflow.cp, 'plot-shifts', out_dir=rdir['trained_model'],
+shift_job = PlotExecutable(workflow.cp, 'plot-model', out_dir=rdir['trained_model'],
                            ifos=workflow.ifos, tags=[])
 node = shift_job.create_node()
-node.add_input_opt('--input-file', trained_model)
+node.add_input_opt('--model-file', trained_model)
+node.add_input_opt('--bank-file', bank_file)
 node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
 workflow.add_node(node)
 layout.two_column_layout(rdir['trained_model'], [(node.output_files[0],)])

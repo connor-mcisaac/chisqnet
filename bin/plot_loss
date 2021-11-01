@@ -19,23 +19,22 @@ parser.add_argument("--output-file", required=True,
 args = parser.parse_args()
 
 with h5py.File(args.input_file, 'r') as f:
-     train_epoch = f['loss_epoch'][:]
-     train_loss = f['loss'][:]
-     val_epoch = f['validation_epoch'][:]
-     val_loss = f['validation_loss'][:]
+     epochs = f.attrs['epoch']
+     train_loss = f['training_loss'][:]
+     val_loss = [f['validation_loss_epoch_{0}'.format(i + 1)][-1] for i in range(epochs)]
 
 caption = "This is a plot of the loss as it evolves with " \
-	  "the number of epochs of training."
+	  "the number of batches of training."
 
 fig, ax = plt.subplots(figsize=(8, 6))
-ax.plot(train_epoch, train_loss, linewidth=3, label='loss', alpha=0.75)
-ax.plot(val_epoch, val_loss, linewidth=3, label='validation loss', alpha=0.75)
-ax.set_xlabel('Epochs', fontsize='large')
+ax.plot(train_loss, linewidth=3, label='training loss', alpha=0.75)
+ax.plot(val_loss, linewidth=3, label='validation loss', alpha=0.75)
+ax.set_xlabel('Batches', fontsize='large')
 ax.set_ylabel('Loss', fontsize='large')
 ax.grid()
 ax.legend()
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
-     title='Loss vs. Epochs',
+     title='Loss vs. Batches',
      caption=caption,
      cmd=' '.join(sys.argv))
 

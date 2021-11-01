@@ -40,13 +40,21 @@ file_attrs = AttributeCollector()
 file_data = DataCollector()
 with h5py.File(args.sample_file, 'r') as f:
      ifos = list(f.keys())
-     file_attrs(f)
+     file_attrs.get_root(f)
+     f.visititems(file_attrs)
      f.visititems(file_data)
 
 file_data.concatenate_datasets()
 
+attributes = file_attrs.groups['/']
 dataset = {}
 for ifo in ifos:
+    for k, v in file_attrs.groups[ifo].items():
+        if k not in attributes.keys():
+            attributes[k] = v
+        elif np.any(attributes[k] != v):
+            raise ValueError("Attributes are different between IFOs")
+
     params = []
     for k in file_data.datasets.keys():
         if k.startswith(ifo):
@@ -85,7 +93,7 @@ validation_idxs = idxs[-validation_num:]
 
 with h5py.File(args.training_file, 'w') as f:
     
-    for k, v in file_attrs.attrs.items():
+    for k, v in attributes.items():
         f.attrs[k] = v
 
     for k, v in dataset.items():
@@ -93,7 +101,7 @@ with h5py.File(args.training_file, 'w') as f:
 
 with h5py.File(args.validation_file, 'w') as f:
     
-    for k, v in file_attrs.attrs.items():
+    for k, v in attributes.items():
         f.attrs[k] = v
 
     for k, v in dataset.items():
