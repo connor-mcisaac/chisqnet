@@ -7,6 +7,29 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
+@tf.custom_gradient
+def print_gradient(x, name):
+    def grad(upstream):
+        print(name)
+        print(upstream)
+        return upstream, None
+    return x, grad
+
+
+@tf.custom_gradient
+def divide_gradient(x, y):
+    def grad(upstream):
+        return upstream / y, None
+    return x, grad
+
+
+@tf.custom_gradient
+def no_grad_div(self, x, y):
+    def grad(upstream):
+        return upstream, None
+    return x / y, grad
+
+
 def real_to_complex(real):
     imag = tf.zeros_like(real, dtype=tf.float32)
     return tf.complex(real, imag)
@@ -69,7 +92,7 @@ class BaseFilter(object):
         inner = 4. * self.delta_f * (tf.math.abs(x) ** 2.) / psd
         sigmasq = tf.math.reduce_sum(inner, axis=2, keepdims=True)
         return real_to_complex(sigmasq ** 0.5)
-    
+
 
 class MatchedFilter(BaseFilter):
 
@@ -256,26 +279,26 @@ class ShiftTransform(BaseTransform):
         dj_idxs_r = tf.clip_by_value(dj_idxs_r, 0, tf.shape(temp)[2] - 1)
         dj_idxs_r = tf.stack([batch_idxs, temp_idxs, dj_idxs_r], axis=3)
 
-        temp = tf.gather_nd(temp, dj_idxs_f) * dj_idxs_f_mask
+        shift_temp = tf.gather_nd(temp, dj_idxs_f) * dj_idxs_f_mask
 
         def grad(dl_ds):
             # rate of change of shifted template wrt df is equal to -1 times
             # the rate of change of the shifted template wrt f
-            ds_df = (temp[:, :, :-2] - temp[:, :, 2:]) / self.delta_f / 2.
+            ds_df = (shift_temp[:, :, :-2] - shift_temp[:, :, 2:]) / self.delta_f / 2.
             dl_df_real = tf.math.real(dl_ds[:, :, 1:-1]) * tf.math.real(ds_df)
             dl_df_imag = tf.math.imag(dl_ds[:, :, 1:-1]) * tf.math.imag(ds_df)
             dl_df = dl_df_real + dl_df_imag
             dl_df = tf.reduce_sum(dl_df, axis=2)
 
-            ds = tf.gather_nd(dl_ds, dj_idxs_r) * dj_idxs_r_mask
-            return ds, dl_df
+            dl_dt = tf.gather_nd(dl_ds, dj_idxs_r) * dj_idxs_r_mask
+            return dl_dt, dl_df
         
-        return temp, grad
+        return shift_temp, grad
 
     def transform(self, temp, sample, training=False):
         dt, df = self.get_dt_df(sample, training=training)
-        temp = self.shift_dt(temp, dt)
         temp = self.shift_df(temp, df)
+        temp = self.shift_dt(temp, dt)
         return temp
 
 
@@ -418,14 +441,15 @@ class PolyShiftTransform(ShiftTransform):
         fig, ax = plt.subplots(figsize=(8, 6))
 
         for i in range(self.nshifts):
-            sc = ax.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool", alpha=0.5)
+            sc = ax.scatter(dts[:, i], dfs[:, i], c=params, cmap="cool",
+                            alpha=0.5, s=15.)
 
         if title:
             ax.set_title(title, fontsize="large")
 
         ax.set_xlim((-self.dt_base * (self.degree + 1),
                      self.dt_base * (self.degree + 1)))
-        ax.set_xlim((-self.df_base * (self.degree + 1),
+        ax.set_ylim((-self.df_base * (self.degree + 1),
                      self.df_base * (self.degree + 1)))
 
         ax.set_xlabel('Time Shift (s)', fontsize='large')
@@ -460,43 +484,53 @@ class NetShiftTransform(ShiftTransform):
         else:
             self.params_base = [params_base]
 
-        shapes = [len(params)] + layer_sizes + [nshifts * 2]
+        shapes = [len(params)] + layer_sizes + [2]
         self.weights = []
         self.biases = []
         self.trainable_weights = {}
-        for i in range(len(shapes) - 1):
-            weight = tf.random.truncated_normal((shapes[i], shapes[i + 1]),
-                                                stddev=tf.math.sqrt(2 / (shapes[i] + shapes[i + 1])),
-                                                dtype=tf.float32)
-            self.weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
-            self.trainable_weights['weight_{0}'.format(i)] = self.weights[-1]
-            if i != (len(shapes) - 2):
-                bias = tf.zeros((shapes[i + 1]), dtype=tf.float32)
-                self.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
-                self.trainable_weights['bias_{0}'.format(i)] = self.biases[-1]
+        for i in range(nshifts):
+            self.weights.append([])
+            self.biases.append([])
+            for j in range(len(shapes) - 1):
+                weight = tf.random.truncated_normal(
+                    (shapes[j], shapes[j + 1]),
+                    stddev=tf.math.sqrt(2 / (shapes[j] + shapes[j + 1])),
+                    dtype=tf.float32
+                )
+                self.weights[i] += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = self.weights[i][j]
+
+                bias = tf.random.truncated_normal(
+                    (shapes[j + 1],),
+                    stddev=0.1,
+                    dtype=tf.float32
+                )
+                self.biases[i] += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = self.biases[i][j]
 
     def get_dt_df(self, sample, training=False):
         params = [sample[p] / pb for p, pb in zip(self.params, self.params_base)]
         params = np.stack(params, axis=-1)
-        values = tf.convert_to_tensor(params.astype(np.float32), dtype=tf.float32)
 
-        for w, b in zip(self.weights[:-1], self.biases):
-            values = tf.matmul(values, w) + b
+        dts = []
+        dfs = []
+        for ws, bs in zip(self.weights, self.biases):
+            values = tf.convert_to_tensor(params[:].astype(np.float32), dtype=tf.float32)
+            for w, b in zip(ws[:-1], bs[:-1]):
+                values = tf.matmul(values, w) + b
+                values = tf.nn.relu(values)
+                if training:
+                    values = tf.nn.dropout(values, rate=0.5)
+
+            values = tf.matmul(values, ws[-1]) + bs[-1]
             values = tf.math.tanh(values)
-            if training:
-                values += tf.random.normal(tf.shape(values), stddev=0.01,
-                                           dtype=tf.float32)
 
-        values = tf.matmul(values, self.weights[-1])
-        values = tf.math.tanh(values)
-        if training:
-            values += tf.random.normal(tf.shape(values), stddev=0.01,
-                                       dtype=tf.float32)
+            dt_mag, df_mag = tf.split(values, 2, axis=-1)
+            dts += [dt_mag * self.dt_max]
+            dfs += [df_mag * self.df_max]
 
-        dt_mag, df_mag = tf.split(values, 2, axis=-1)
-        dt = dt_mag * self.dt_max
-        df = df_mag * self.df_max
-
+        dt = tf.concat(dts, axis=-1)
+        df = tf.concat(dfs, axis=-1)
         return dt, df
 
     @classmethod
@@ -533,9 +567,11 @@ class NetShiftTransform(ShiftTransform):
             _ = g.create_dataset("params_base", data=np.array(self.params_base))
             g.attrs['layers_num'] = len(self.weights)
             for i in range(len(self.weights)):
-                _ = g.create_dataset("weights_{0}".format(i), data=self.weights[i].numpy())
-                if i != (len(self.weights) - 1):
-                    _ = g.create_dataset("biases_{0}".format(i), data=self.biases[i].numpy())
+                for j in range(len(self.weights[i])):
+                    _ = g.create_dataset("net_{0}_weight_{1}".format(i, j),
+                                         data=self.weights[i][j].numpy())
+                    _ = g.create_dataset("net_{0}_bias_{1}".format(i, j),
+                                         data=self.biases[i][j].numpy())
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -550,8 +586,10 @@ class NetShiftTransform(ShiftTransform):
             params = list(g["params"][:])
             params_base = list(g["params_base"][:])
             num = g.attrs['layers_num']
-            weights = [g["weights_{0}".format(i)][:] for i in range(num)]
-            biases = [g["biases_{0}".format(i)][:] for i in range(num)]
+            weights = [[g["net_{0}_weight_{1}".format(i, j)][:] for j in range(num)]
+                       for i in range(nshifts)]
+            biases = [[g["net_{0}_bias_{1}".format(i, j)][:] for j in range(num)]
+                      for i in range(nshifts)]
 
         if isinstance(params[0], bytes):
             params = [p.decode() for p in params]
@@ -559,67 +597,78 @@ class NetShiftTransform(ShiftTransform):
         obj = cls(nshifts, [], dt_max, df_max, params, params_base,
                   freqs, f_low, f_high)
 
-        obj.weights = [tf.Variable(w, trainable=True, dtype=tf.float32) for w in weights]
-        obj.biases = [tf.Variable(b, trainable=True, dtype=tf.float32) for b in biases]
+        obj.weights = [[tf.Variable(w, trainable=True, dtype=tf.float32) for w in ws]
+                       for ws in weights]
+        obj.biases = [[tf.Variable(b, trainable=True, dtype=tf.float32) for b in bs]
+                      for bs in biases]
 
         obj.trainable_weights = {}
-        for i in range(num):
-            obj.trainable_weights['weight_{0}'.format(i)] = obj.weights[i]
-            if i != (num - 1):
-                obj.trainable_weights['bias_{0}'.format(i)] = obj.biases[i]
+        for i in range(nshifts):
+            for j in range(num):
+                obj.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = obj.weights[i][j]
+                obj.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = obj.biases[i][j]
 
         return obj
 
     def plot_model(self, bank, title=None):
         params = {p: bank.table[p] / pb for p, pb in zip(self.params, self.params_base)}
         
-        dts, dfs = self.get_dt_df(params)
-        dts = dts.numpy()
-        dfs = dfs.numpy()
+        mtotal_min = np.min(bank.table.mtotal)
+        mtotal_max = np.max(bank.table.mtotal)
+        mass1_min = np.min(bank.table.mass1)
+        mass1_max = np.max(bank.table.mass1)
+        mass2_min = np.min(bank.table.mass2)
+        mass2_max = np.max(bank.table.mass2)
+        
+        fig, ax = plt.subplots(ncols=5, nrows=2, figsize=(48, 16))
 
-        mass1 = bank.table.mass1
-        mass2 = bank.table.mass2
-        
-        duration = bank.table.template_duration
-        spin = bank.table.chi_eff
+        for i in range(-2, 3):
+            params = {'spin1z': np.ones((100,), dtype=np.float32) * (i / 2.),
+                      'spin2z': np.ones((100,), dtype=np.float32) * (i / 2.)}
 
-        fig, ax = plt.subplots(ncols=self.nshifts + 1, nrows=4,
-                               figsize=(6 * (self.nshifts + 1), 18))
-        
-        for i in range(self.nshifts):
-            sct = ax[0, i+1].scatter(mass1, mass2, c=dts[:, i],
-                                     vmin=-self.dt_max, vmax=self.dt_max,
-                                     cmap="coolwarm")
-            sct = ax[1, i+1].scatter(duration, spin, c=dts[:, i],
-                                     vmin=-self.dt_max, vmax=self.dt_max,
-                                     cmap="coolwarm")
-            scf = ax[2, i+1].scatter(mass1, mass2, c=dfs[:, i],
-                                     vmin=-self.df_max, vmax=self.df_max,
-                                     cmap="coolwarm")
-            scf = ax[3, i+1].scatter(duration, spin, c=dfs[:, i],
-                                     vmin=-self.df_max, vmax=self.df_max,
-                                     cmap="coolwarm")
-            ax[0, i+1].set_xscale('log')
-            ax[0, i+1].set_yscale('log')
-            ax[1, i+1].set_xscale('log')
-            ax[1, i+1].set_yscale('log')
-            ax[2, i+1].set_xscale('log')
-            ax[2, i+1].set_yscale('log')
-            ax[3, i+1].set_xscale('log')
-            ax[3, i+1].set_yscale('log')
-            ax[0, i+1].grid()
-            ax[1, i+1].grid()
-            ax[2, i+1].grid()
-            ax[3, i+1].grid()
-        
-        cbt = fig.colorbar(sct, ax=ax[0:2, 0], location='left')
-        cbt.ax.set_ylabel('Time Shift (s)', fontsize='small')
-        cbf = fig.colorbar(scf, ax=ax[2:4, 0], location='left')
-        cbf.ax.set_ylabel('Frequency Shift (Hz)', fontsize='small')
-        ax[0, 0].axis('off')
-        ax[1, 0].axis('off')
-        ax[2, 0].axis('off')
-        ax[3, 0].axis('off')
+            mass = np.linspace(mtotal_min, mtotal_max, num=100, endpoint=True)
+            params['mass1'] = mass / 2.
+            params['mass2'] = mass / 2.
+
+            dts, dfs = self.get_dt_df(params)
+            dts = dts.numpy()
+            dfs = dfs.numpy()
+
+            for j in range(self.nshifts):
+                sc = ax[0, i+2].scatter(dts[:, j], dfs[:, j], c=mass, cmap="cool",
+                                        alpha=0.5, s=15.)
+
+                ax[0, i+2].set_xlim((-self.dt_max, self.dt_max))
+                ax[0, i+2].set_ylim((-self.df_max, self.df_max))
+
+                ax[0, i+2].set_xlabel('Time Shift (s)', fontsize='large')
+                ax[0, i+2].set_ylabel('Frequency Shift (Hz)', fontsize='large')
+
+            ax[0, i+2].grid()
+            cbar = fig.colorbar(sc, ax=ax[0, i+2])
+            cbar.ax.set_ylabel('Total Mass', fontsize='large')
+
+            params['mass1'] = np.linspace(mass1_min, mass1_max, num=100, endpoint=True)
+            params['mass2'] = np.ones((100,), dtype=np.float32) * mass2_min
+
+            dts, dfs = self.get_dt_df(params)
+            dts = dts.numpy()
+            dfs = dfs.numpy()
+
+            for j in range(self.nshifts):
+                sc = ax[1, i+2].scatter(dts[:, j], dfs[:, j], c=params['mass1'], cmap="cool",
+                                        alpha=0.5, s=15.)
+
+                ax[1, i+2].set_xlim((-self.dt_max, self.dt_max))
+                ax[1, i+2].set_ylim((-self.df_max, self.df_max))
+
+                ax[1, i+2].set_xlabel('Time Shift (s)', fontsize='large')
+                ax[1, i+2].set_ylabel('Frequency Shift (Hz)', fontsize='large')
+
+            ax[1, i+2].grid()
+            cbar = fig.colorbar(sc, ax=ax[1, i+2])
+            cbar.ax.set_ylabel('Mass1', fontsize='large')
+
         if title:
             fig.suptitle(title, fontsize="large")
 
@@ -628,45 +677,71 @@ class NetShiftTransform(ShiftTransform):
 
 class Convolution1DTransform(BaseTransform):
 
-    def __init__(self, nkernel, max_df, max_dt, freqs, f_low, f_high):
+    def normalise(self, x):
+        denom = real_to_complex(tf.math.reduce_mean(tf.math.abs(x), axis=0) + 1e-7)
+        return x / denom
+
+    def clip(self, x):
+        return tf.clip_by_value(x, - self.max_dt, self.max_dt)
+
+    def __init__(self, nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high):
         
         super().__init__(freqs, f_low, f_high)
 
         self.nkernel = nkernel
+        self.kernel_df = kernel_df
         self.max_df = max_df
         self.max_dt = max_dt
-        self.half_width = int(max_df // self.delta_f)
 
-        def normalise(x):
-            return x / (tf.math.reduce_sum(tf.math.abs(x)) + 1e-7)
+        self.conv_half_width = int(max_df // self.delta_f)
+        conv_freqs = np.arange(self.conv_half_width * 2 + 1) * self.delta_f
+        conv_freqs -= conv_freqs[self.conv_half_width + 1]
+        self.conv_freqs = tf.convert_to_tensor(conv_freqs.astype(np.float32), dtype=tf.float32)
 
-        kernels_real = tf.random.truncated_normal((self.half_width * 2 + 1, 1, nkernel),
+        self.kernel_half_width = int(max_df // kernel_df)
+        self.kernel_freqs = np.arange(self.kernel_half_width * 2 + 1) * self.kernel_df
+        self.kernel_freqs -= self.kernel_freqs[self.kernel_half_width + 1]
+
+        diff_f = conv_freqs[:, np.newaxis] - self.kernel_freqs[np.newaxis, :]
+        frac = np.maximum(diff_f / self.kernel_df, 0.)
+
+        interp_idx = np.maximum(0, np.sum(diff_f >= 0, axis=1) - 1)
+        interp_frac = frac[np.arange(len(conv_freqs)), interp_idx]
+
+        interp_idx = np.repeat(interp_idx[np.newaxis, :, np.newaxis, np.newaxis], nkernel, axis=3)
+        kernel_idx = np.repeat(
+            np.arange(nkernel)[np.newaxis, np.newaxis, np.newaxis, :],
+            self.conv_half_width * 2 + 1, axis=1
+        )
+        interp_gather = np.stack([interp_idx, kernel_idx], axis=-1)
+
+        interp_frac = np.repeat(interp_frac[np.newaxis, :, np.newaxis, np.newaxis], nkernel, axis=3)
+
+        self.interp_gather = tf.convert_to_tensor(interp_gather, dtype=tf.int64)
+        self.interp_frac = tf.convert_to_tensor(interp_frac, dtype=tf.complex64)
+
+        self.kernel_max_df = tf.constant(-1. * self.kernel_freqs[0], dtype=tf.float32)
+
+        kernels_real = tf.random.truncated_normal((self.kernel_half_width * 2 + 1, nkernel),
                                                   dtype=tf.float32)
-        kernels_real = normalise(kernels_real)
-        self.kernels_real = tf.Variable(kernels_real, dtype=tf.float32,
-                                        trainable=True, constraint=normalise)
-
-        kernels_imag = tf.random.truncated_normal((self.half_width * 2 + 1, 1, nkernel),
+        kernels_imag = tf.random.truncated_normal((self.kernel_half_width * 2 + 1, nkernel),
                                                   dtype=tf.float32)
-        kernels_imag = normalise(kernels_imag)
-        self.kernels_imag = tf.Variable(kernels_imag, dtype=tf.float32,
-                                        trainable=True, constraint=normalise)
+        kernels = tf.complex(kernels_real, kernels_imag)
+        self.kernels = tf.Variable(self.normalise(kernels),
+                                   dtype=tf.complex64, trainable=True,
+                                   constraint=self.normalise)
 
-        def clip(x):
-            x = tf.clip_by_value(x, - max_dt, max_dt)
-            return x
+        dts = tf.random.truncated_normal((nkernel,), dtype=tf.float32)
+        self.dt_weights = tf.Variable(dts, dtype=tf.float32, trainable=True)
 
-        dts = np.zeros(nkernel)
-        self.dts = tf.Variable(dts, dtype=tf.float32, trainable=True, constraint=clip)
-
-        self.trainable_weights = {'kernel_real': self.kernels_real,
-                                  'kernel_imag': self.kernels_imag,
-                                  'dt': self.dts}
+        self.trainable_weights = {'kernels': self.kernels,
+                                  'dt_weights': self.dt_weights}
 
     @tf.function
     def shift_dt(self, temp):
+        dt = tf.math.tanh(self.dt_weights) * self.max_dt
 
-        dt = tf.expand_dims(self.dts, 0)
+        dt = tf.expand_dims(dt, 0)
         dt = tf.expand_dims(dt, 2)
 
         freqs = tf.expand_dims(self.freqs, 0)
@@ -685,26 +760,37 @@ class Convolution1DTransform(BaseTransform):
 
         temp = tf.expand_dims(temp, 1)
 
-        shape = tf.shape(temp)
-        pad_shape = tf.concat([shape[:-1], tf.constant([self.half_width])], axis=0)
-        pad = tf.zeros(pad_shape, dtype=tf.complex64)
-        temp = tf.concat([pad, temp, pad], axis=2)
+        kernels = self.kernels
+
+        diff = tf.concat([kernels[1:, :] - kernels[:-1, :],
+                          tf.zeros([1, self.nkernel], dtype=tf.complex64)], 0)
+
+        kernels = (
+            tf.gather_nd(kernels, self.interp_gather)
+            + self.interp_frac * tf.gather_nd(diff, self.interp_gather)
+        )
+        kernels_real = tf.math.real(kernels)
+        kernels_imag = tf.math.imag(kernels)
 
         temp = tf.transpose(temp, perm=[0, 2, 1])
-
+        temp = tf.expand_dims(temp, axis=1)
         temp_real = tf.math.real(temp)
         temp_imag = tf.math.imag(temp)
 
-        ctemp_real = tf.nn.conv1d(temp_real, self.kernels_real, 1, 'VALID', data_format='NWC')
-        ctemp_real -= tf.nn.conv1d(temp_imag, self.kernels_imag, 1, 'VALID', data_format='NWC')
-        ctemp_imag = tf.nn.conv1d(temp_imag, self.kernels_real, 1, 'VALID', data_format='NWC')
-        ctemp_imag += tf.nn.conv1d(temp_real, self.kernels_imag, 1, 'VALID', data_format='NWC')
+        padding = [[0, 0], [0, 0], [self.conv_half_width, self.conv_half_width], [0, 0]]
+
+        ctemp_real = tf.nn.conv2d(temp_real, kernels_real, 1, padding, data_format='NHWC')
+        ctemp_real -= tf.nn.conv2d(temp_imag, kernels_imag, 1, padding, data_format='NHWC')
+        ctemp_imag = tf.nn.conv2d(temp_imag, kernels_real, 1, padding, data_format='NHWC')
+        ctemp_imag += tf.nn.conv2d(temp_real, kernels_imag, 1, padding, data_format='NHWC')
 
         ctemp = tf.complex(ctemp_real, ctemp_imag)
+        ctemp = tf.squeeze(ctemp)
         ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
 
+        div = tf.convert_to_tensor(self.conv_half_width * 2 + 1, dtype=tf.complex64)
+        ctemp = ctemp / div
         return ctemp
-
 
     def transform(self, temp, sample, training=False):
         temp = self.convolve(temp, training=training)
@@ -717,10 +803,11 @@ class Convolution1DTransform(BaseTransform):
         config.read(config_file)
 
         nkernel = config.getint(section, 'kernel-num')
+        kernel_df = config.getfloat(section, 'delta-f')
         max_df = config.getfloat(section, 'frequency-width')
         max_dt = config.getfloat(section, 'max-time-shift')
 
-        obj = cls(nkernel, max_df, max_dt, freqs, f_low, f_high)
+        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -735,11 +822,12 @@ class Convolution1DTransform(BaseTransform):
             else:
                 g = f
             _ = g.create_dataset('nkernel', np.array([self.nkernel]))
+            _ = g.create_dataset('kernel_df', np.array([self.kernel_df]))
             _ = g.create_dataset('max_df', np.array([self.max_df]))
             _ = g.create_dataset('max_dt', np.array([self.max_dt]))
             _ = g.create_dataset('kernels_real', self.kernels_real.numpy())
             _ = g.create_dataset('kernels_imag', self.kernels_imag.numpy())
-            _ = g.create_dataset('dts', self.dts.numpy())
+            _ = g.create_dataset('dt_weights', self.dt_weights.numpy())
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -749,52 +837,49 @@ class Convolution1DTransform(BaseTransform):
             else:
                 g = f
             nkernel = g['nkernel'][0]
+            kernel_df = g['kernel_df'][0]
             max_df = f['max_df'][0]
             max_dt = g['max_dt'][0]
             kernels_real = g['kernels_real'][:]
             kernels_imag = g['kernels_imag'][:]
-            dts = g['dts'][:]
+            dt_weights = g['dt_weights'][:]
             
-        obj = cls(nkernel, max_df, max_dt, freqs, f_low, f_high)
-
-        def normalise(x):
-            return x / (tf.math.reduce_sum(tf.math.abs(x)) + 1e-7)
+        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high)
 
         obj.kernels_real = tf.Variable(kernels_real, dtype=tf.float32,
-                                       trainable=True, constraint=normalise)
+                                       trainable=True, constraint=self.normalise)
         obj.kernels_imag = tf.Variable(kernels_imag, dtype=tf.float32,
-                                       trainable=True, constraint=normalise)
+                                       trainable=True, constraint=self.normalise)
 
-        def clip(x):
-            x = tf.clip_by_value(x, - max_dt, max_dt)
-            return x
-
-        obj.dts = tf.Variable(dts, dtype=tf.float32, trainable=True, constraint=clip)
+        obj.dt_weights = tf.Variable(dt_weights, dtype=tf.float32, trainable=True)
 
         obj.trainable_weights = {'kernel_real': obj.kernels_real,
                                  'kernel_imag': obj.kernels_imag,
-                                 'dt': obj.dts}
+                                 'dt': obj.dt_weights}
         return obj
 
     def plot_model(self, bank, title=None):
-        freqs = np.arange(self.half_width * 2 + 1) * self.delta_f
-        freqs -= freqs[self.half_width + 1]
-
         fig, ax = plt.subplots(nrows=self.nkernel,
                                figsize=(8, 6 * self.nkernel))
 
+        kernels_real = tf.math.real(self.kernels)
+        kernels_imag = tf.math.imag(self.kernels)
+
+        dt = tf.math.tanh(self.dt_weights) * self.max_dt
+
         for i in range(self.nkernel):
-            ax[i].plot(freqs, self.kernels_real.numpy()[:, 0, i], label='real', alpha=0.75)
-            ax[i].plot(freqs, self.kernels_imag.numpy()[:, 0, i], label='imag', alpha=0.75)
+            ax[i].plot(self.kernel_freqs, kernels_real.numpy()[:, i], label='real', alpha=0.75)
+            ax[i].plot(self.kernel_freqs, kernels_imag.numpy()[:, i], label='imag', alpha=0.75)
             
-            max_amp = max(np.max(np.abs(self.kernels_real.numpy()[:, 0, i])),
-                          np.max(np.abs(self.kernels_imag.numpy()[:, 0, i])))
+            max_amp = max(np.max(np.abs(kernels_real.numpy()[:, i])),
+                          np.max(np.abs(kernels_imag.numpy()[:, i])))
             ax[i].set_ylim([-max_amp, max_amp])
 
             ax[i].legend()
-            ax[i].set_title('Time Shift (s) = {0}'.format(self.dts[i]), fontsize='small')
+            ax[i].set_title('Time Shift (s) = {0}'.format(dt[i]), fontsize='small')
             ax[i].set_xlabel('Frequency (Hz)', fontsize='small')
             ax[i].set_ylabel('Amplitude', fontsize='small')
+            ax[i].grid()
 
         if title:
             fig.suptitle(title, fontsize="large")
@@ -831,6 +916,7 @@ class ChisqFilter(MatchedFilter):
 
     def get_max_snr_prime(self, temp, segs, psds, params,
                           gather_idxs=None, max_snr=False, **kwargs):
+
         chi_temps = self.transform.transform(temp, params, **kwargs)
         logging.info("Templates transformed")
 
@@ -887,5 +973,5 @@ def select_transformation(transformation_key):
     if transformation_key in options.keys():
         return options[transformation_key]
 
-    raise ValueError("{0} is not a valid transformation, select from {1}".format(options.keys()))
+    raise ValueError("{0} is not a valid transformation, select from {1}".format(transformation_key, options.keys()))
 
