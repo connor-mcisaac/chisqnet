@@ -106,8 +106,9 @@ class MatchedFilter(BaseFilter):
         if sigma is None:
             sigma = self.sigma(temp, psd)
         lgc = tf.math.not_equal(sigma, tf.zeros_like(sigma))
+        mask = tf.cast(lgc, tf.complex64)
         sigma = tf.where(lgc, sigma, tf.ones_like(sigma))
-        norm_temp = temp / sigma
+        norm_temp = mask * temp / sigma
 
         ow_data = data / real_to_complex(psd)
 
@@ -159,6 +160,7 @@ class MatchedFilter(BaseFilter):
 
 
 class BaseTransform(BaseFilter):
+    transformation_type = "base"
 
     @tf.function
     @add_temp_axis
@@ -181,42 +183,384 @@ class BaseTransform(BaseFilter):
         
         thresh = tf.ones_like(overlap) * thresh
         lgc = tf.less(overlap, thresh)
+        mask = tf.cast(lgc, tf.complex64)
         overlap = tf.where(lgc, overlap_cplx, tf.zeros_like(overlap_cplx))
 
         ortho = ((temp_norm - overlap * base_norm)
                  / (1 - overlap * tf.math.conj(overlap)) ** 0.5)
-        ortho = self.pad(ortho)
-
-        return ortho, lgc
+        ortho = self.pad(ortho) * mask
+        return ortho
 
     def transform(self, temp, params, training=False):
 
-        err = "This method shoulkd be overwritten by a child class. "
+        err = "This method should be overwritten by a child class. "
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
 
-        err = "This method shoulkd be overwritten by a child class. "
+        err = "This method should be overwritten by a child class. "
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
     def to_file(self, file_path, group=None, append=False):
 
-        err = "This method shoulkd be overwritten by a child class. "
+        err = "This method should be overwritten by a child class. "
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
 
-        err = "This method shoulkd be overwritten by a child class. "
+        err = "This method should be overwritten by a child class. "
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
 
+class TemplateMixer(object):
+
+    def __init__(self, templates_in, templates_out, layer_sizes,
+                 params, params_base):
+        self.templates_in = templates_in
+        self.templates_out = templates_out
+        
+        if isinstance(params, list):
+            self.params = params
+        else:
+            self.params = [params]
+
+        if isinstance(params_base, list):
+            self.params_base = params_base
+        else:
+            self.params_base = [params_base]
+
+        shapes = [len(params)] + layer_sizes + [templates_in]
+        self.weights = []
+        self.biases = []
+        self.trainable_weights = {}
+
+        for i in range(templates_out):
+            self.weights.append([])
+            self.biases.append([])
+            for j in range(len(shapes) - 1):
+                weight = tf.random.truncated_normal(
+                    (shapes[j], shapes[j + 1]),
+                    stddev=tf.math.sqrt(2 / (shapes[j] + shapes[j + 1])),
+                    dtype=tf.float32
+                )
+                self.weights[i] += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = self.weights[i][j]
+
+                bias = tf.zeros((shapes[j + 1],), dtype=tf.float32)
+                self.biases[i] += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = self.biases[i][j]
+
+    def get_mixer(self, sample, training=False):
+        params = [sample[p] / pb for p, pb in zip(self.params, self.params_base)]
+        params = np.stack(params, axis=-1)
+
+        mixes = []
+        for ws, bs in zip(self.weights, self.biases):
+            values = tf.convert_to_tensor(params[:].astype(np.float32), dtype=tf.float32)
+            for w, b in zip(ws[:-1], bs[:-1]):
+                values = tf.matmul(values, w) + b
+                values = tf.math.sigmoid(values)
+                if training:
+                    values = tf.nn.dropout(values, 0.25)
+            values = tf.matmul(values, ws[-1]) + bs[-1]
+            values = 1e-6 + (1 - 1e-6) * tf.math.sigmoid(values)
+            if training:
+                noise = tf.random.truncated_normal(tf.shape(values), stddev=0.1)
+                values = values + noise
+            values = values / tf.reduce_sum(values, axis=1, keepdims=True)
+            mixes += [values]
+
+        mixer = tf.stack(mixes, axis=-1)
+        return mixer
+
+    def mix_temps(self, temps, sample, training=False):
+        mixer = self.get_mixer(sample, training=training)
+        mixer = real_to_complex(mixer)
+
+        temps = tf.transpose(temps, perm=[0, 2, 1])
+        temps = tf.matmul(temps, mixer)
+        temps = tf.transpose(temps, perm=[0, 2, 1])
+
+        return temps
+
+    @classmethod
+    def from_config(cls, config_file, section="model"):
+        config = configparser.ConfigParser()
+        config.read(config_file)
+
+        templates_in = config.getint(section, 'templates-in')
+        templates_out = config.getint(section, 'templates-out')
+        layer_sizes = [int(l) for l in config.get(section, "layer-sizes").split(',')]
+        params = config.get(section, "params").split(',')
+        params_base = [float(p) for p in config.get(section, "params-base").split(',')]
+
+        obj = cls(templates_in, templates_out, layer_sizes,
+                  params, params_base)
+        return obj
+
+    def to_file(self, file_path, group=None, append=False):
+        if append:
+            file_mode = 'a'
+        else:
+            file_mode = 'w'
+
+        with h5py.File(file_path, file_mode) as f:
+            if group:
+                g = f.create_group(group)
+            else:
+                g = f
+            _ = g.create_dataset('templates_out', data=np.array([self.templates_out]))
+            _ = g.create_dataset('params', data=np.array(self.params).astype('S'))
+            _ = g.create_dataset('params_base', data=np.array(self.params_base))
+            g.attrs['layers_num'] = len(self.weights[0])
+            for i in range(len(self.weights)):
+                for j in range(len(self.weights[i])):
+                    _ = g.create_dataset("net_{0}_weight_{1}".format(i, j),
+                                         data=self.weights[i][j].numpy())
+                    _ = g.create_dataset("net_{0}_bias_{1}".format(i, j),
+                                         data=self.biases[i][j].numpy())
+
+    @classmethod
+    def from_file(cls, file_path, group=None):
+        with h5py.File(file_path, 'r') as f:
+            if group:
+                g = f[group]
+            else:
+                g = f
+            templates_out = g['templates_out'][0]
+            params = list(g["params"][:])
+            params_base = list(g["params_base"][:])
+            num = g.attrs['layers_num']
+            weights = [[g["net_{0}_weight_{1}".format(i, j)][:] for j in range(num)]
+                       for i in range(templates_out)]
+            biases = [[g["net_{0}_bias_{1}".format(i, j)][:] for j in range(num)]
+                      for i in range(templates_out)]
+
+        if isinstance(params[0], bytes):
+            params = [p.decode() for p in params]
+
+        obj = cls(1, templates_out, [],
+                  params, params_base)
+
+        obj.weights = [[tf.Variable(w, trainable=True, dtype=tf.float32) for w in ws]
+                       for ws in weights]
+        obj.biases = [[tf.Variable(b, trainable=True, dtype=tf.float32) for b in bs]
+                      for bs in biases]
+
+        obj.trainable_weights = {}
+        for i in range(templates_out):
+            for j in range(num):
+                obj.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = obj.weights[i][j]
+                obj.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = obj.biases[i][j]
+
+        return obj
+
+    def plot_model(self, bank, title=None):
+        params = {p: bank.table[p] / pb for p, pb in zip(self.params, self.params_base)}
+        
+        mixer = self.get_mixer(params)
+        mixer = mixer.numpy()
+
+        mtotal = bank.table.mtotal
+        duration = bank.table.template_duration
+
+        fig, ax = plt.subplots(nrows=self.templates_in, ncols=self.templates_out * 2,
+                               figsize=(16 * self.templates_out, 6 * self.templates_in))
+
+        for i in range(self.templates_in):
+            for j in range(self.templates_out):
+                sct = ax[i, j*2].scatter(mtotal, mixer[:, i, j], c=mixer[:, i, j],
+                                         vmin=0, vmax=1,
+                                         cmap="inferno")
+                sct = ax[i, j*2+1].scatter(duration, mixer[:, i, j], c=mixer[:, i, j],
+                                           vmin=0, vmax=1,
+                                           cmap="inferno")
+                ax[i, j*2].set_ylim((0, 1))
+                ax[i, j*2+1].set_ylim((0, 1))
+                ax[i, j*2].set_xscale('log')
+                ax[i, j*2+1].set_xscale('log')
+                ax[i, j*2].grid()
+                ax[i, j*2+1].grid()
+
+        if title:
+            fig.suptitle(title, fontsize="large")
+
+        return fig, ax
+
+
+class ChisqFilter(MatchedFilter):
+
+    def clip(self, x):
+        return tf.clip_by_value(x, 1., self.threshold_max)
+
+    def __init__(self, freqs, f_low, f_high, transform, mixer=None, threshold_max=2.):
+        super().__init__(freqs, f_low, f_high)
+        self.transform = transform
+        self.mixer = mixer
+        self.threshold_max = threshold_max
+        self.threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
+                                     dtype=tf.float32, constraint=self.clip)
+        self.trainable_weights = {}
+        for k, v in self.transform.trainable_weights.items():
+            self.trainable_weights[k] = v
+        if self.mixer:
+            for k, v in self.mixer.trainable_weights.items():
+                self.trainable_weights[k] = v
+        self.trainable_weights['threshold'] = self.threshold
+
+    def get_max_idx(self, data, gather_idxs=None):
+        if gather_idxs is not None:
+            data = tf.gather_nd(data, gather_idxs)
+        max_data_idx = tf.math.argmax(data, axis=-1)
+
+        max_data_gather = tf.stack([tf.range(tf.shape(max_data_idx)[0], dtype=tf.int64),
+                                    max_data_idx], axis=-1)
+
+        if gather_idxs is not None:
+            max_data_idx = max_data_idx + gather_idxs[:, 0, 1]
+
+        max_data = tf.gather_nd(data, max_data_gather)
+        return max_data, max_data_idx
+
+    def get_max_snr(self, temp, segs, psds, gather_idxs=None):
+        snr, _ = self.matched_filter(temp, segs, psds)
+        snr = snr[:, 0, :]
+        max_snr, max_snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
+        return max_snr, max_snr_idx
+
+    def get_max_snr_prime(self, temp, segs, psds, params,
+                          gather_idxs=None, max_snr=False, training=False):
+
+        chi_temps = self.transform.transform(temp, params, training=training)
+        logging.info("Templates transformed")
+
+        chi_orthos = self.transform.get_ortho(chi_temps, temp, psds)
+        logging.info("Orthogonal templates created")
+
+        if self.mixer:
+            chi_orthos = self.mixer.mix_temps(chi_orthos, params, training=training)
+
+        snr, _ = self.matched_filter(temp, segs, psds)
+        snr = snr[:, 0, :]
+        snr_idx = None
+        if max_snr:
+            snr, snr_idx = self.get_max_snr(temp, segs, psds, gather_idxs=gather_idxs)
+        elif gather_idxs is not None:
+            snr = tf.gather_nd(snr, gather_idxs)
+
+        chis, lgc = self.matched_filter(chi_orthos, segs, psds, idx=snr_idx)
+
+        mask = tf.cast(lgc, tf.float32)
+        if max_snr:
+            mask = mask[:, :, 0]
+        ortho_num = tf.reduce_sum(mask, axis=1)
+        ortho_num = tf.math.maximum(ortho_num, tf.ones_like(ortho_num))
+        logging.info("SNRs calculated")
+
+        chisq = tf.math.reduce_sum(chis ** 2., axis=1)
+
+        if (not max_snr) and (gather_idxs is not None):
+            chisq = tf.gather_nd(chisq, gather_idxs)
+
+        rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
+
+        chisq_thresh = rchisq / self.threshold
+        chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
+
+        snr_prime = snr / chisq_thresh ** 0.5
+
+        if not max_snr:
+            snr_prime, max_idx = self.get_max_idx(snr_prime)
+            gather_max = tf.stack([tf.range(len(max_idx), dtype=tf.int64), max_idx], axis=-1)
+            chisq_thresh = tf.gather_nd(chisq_thresh, gather_max)
+        logging.info("SNR' calculated")
+        return snr_prime, chisq_thresh
+
+    @classmethod
+    def from_config(cls, config_file, freqs, f_low, f_high):
+        config = configparser.ConfigParser()
+        config.read(config_file)
+
+        transform_type = config.get("model", "transformation")
+        transform_class = select_transformation(transform_type)
+        transform = transform_class.from_config(
+            config_file, freqs, f_low, f_high, section="transformation"
+        )
+
+        if config.has_section("mixer"):
+            mixer = TemplateMixer.from_config(config_file, section="mixer")
+        else:
+            mixer = None
+
+        threshold_max = config.getfloat("model", "threshold-max")
+        obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
+                  threshold_max=threshold_max)
+        return obj
+
+    def to_file(self, file_path, group=None, append=False):
+        if append:
+            file_mode = 'a'
+        else:
+            file_mode = 'w'
+
+        with h5py.File(file_path, file_mode) as f:
+            if group:
+                g = f.create_group(group)
+            else:
+                g = f
+            _ = g.create_dataset("threshold_max", data=np.array([self.threshold_max]))
+            _ = g.create_dataset("threshold", data=self.threshold.numpy())
+
+        if group is None:
+            group = ''
+        self.transform.to_file(file_path, group=group + '/transform', append=append)
+        self.mixer.to_file(file_path, group=group + '/mixer', append=append)
+        
+    @classmethod
+    def from_file(cls, file_path, freqs, f_low, f_high, group=None):
+        with h5py.File(file_path, 'r') as f:
+            if group:
+                g = f[group]
+            else:
+                g = f
+            threshold_max = g["threshold_max"][0]
+            threshold = g["threshold"][0]
+            if (group + '/mixer') in g.keys():
+                mixer_check = True
+            else:
+                mixer_check = False
+
+        transform = load_transformation(file_path, freqs, f_low, f_high,
+                                        group=group + 'transform')
+        if mixer_check:
+            mixer = TemplateMixer.from_file(file_path, group=group + '/mixer')
+        else:
+            mixer = None
+
+        obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
+                  threshold_max=threshold_max)
+
+        obj.threshold = tf.Variable(np.array([threshold], dtype=np.float32), trainable=True,
+                                    dtype=tf.float32, constraint=obj.clip)
+        obj.trainable_weights = {}
+        for k, v in obj.transform.trainable_weights.items():
+            obj.trainable_weights[k] = v
+        if obj.mixer:
+            for k, v in obj.mixer.trainable_weights.items():
+                obj.trainable_weights[k] = v
+        obj.traiable_weights['threshold'] = obj.threshold
+
+        return obj
+
+
 class ShiftTransform(BaseTransform):
+    transformation_type = "shift"
 
     @tf.function
     def shift_dt(self, temp, dt):
@@ -303,6 +647,7 @@ class ShiftTransform(BaseTransform):
 
 
 class PolyShiftTransform(ShiftTransform):
+    transformation_type = "polyshift"
 
     def __init__(self, nshifts, degree, dt_base, df_base, param, param_base,
                  freqs, f_low, f_high, offset=None):
@@ -392,6 +737,7 @@ class PolyShiftTransform(ShiftTransform):
                 g = f.create_group(group)
             else:
                 g = f
+            g.attrs['transformation_type'] = self.transformation_type
             _ = g.create_dataset("nshifts", data=np.array([self.nshifts]))
             _ = g.create_dataset("degree", data=np.array([self.degree]))
             _ = g.create_dataset("dt_base", data=np.array([self.dt_base]))
@@ -463,6 +809,7 @@ class PolyShiftTransform(ShiftTransform):
 
 
 class NetShiftTransform(ShiftTransform):
+    transformation_type = "netshift"
 
     def __init__(self, nshifts, layer_sizes, dt_max, df_max, params, params_base,
                  freqs, f_low, f_high):
@@ -560,12 +907,13 @@ class NetShiftTransform(ShiftTransform):
                 g = f.create_group(group)
             else:
                 g = f
+            g.attrs['transformation_type'] = self.transformation_type
             _ = g.create_dataset("nshifts", data=np.array([self.nshifts]))
             _ = g.create_dataset("dt_max", data=np.array([self.dt_max]))
             _ = g.create_dataset("df_max", data=np.array([self.df_max]))
             _ = g.create_dataset("params", data=np.array(self.params).astype('S'))
             _ = g.create_dataset("params_base", data=np.array(self.params_base))
-            g.attrs['layers_num'] = len(self.weights)
+            g.attrs['layers_num'] = len(self.weights[0])
             for i in range(len(self.weights)):
                 for j in range(len(self.weights[i])):
                     _ = g.create_dataset("net_{0}_weight_{1}".format(i, j),
@@ -676,6 +1024,7 @@ class NetShiftTransform(ShiftTransform):
 
 
 class Convolution1DTransform(BaseTransform):
+    transformation_type = "convolution"
 
     def normalise(self, x):
         denom = real_to_complex(tf.math.reduce_mean(tf.math.abs(x), axis=0) + 1e-7)
@@ -821,12 +1170,13 @@ class Convolution1DTransform(BaseTransform):
                 g = f.create_group(group)
             else:
                 g = f
+            g.attrs['transformation_type'] = self.transformation_type
             _ = g.create_dataset('nkernel', np.array([self.nkernel]))
             _ = g.create_dataset('kernel_df', np.array([self.kernel_df]))
             _ = g.create_dataset('max_df', np.array([self.max_df]))
             _ = g.create_dataset('max_dt', np.array([self.max_dt]))
-            _ = g.create_dataset('kernels_real', self.kernels_real.numpy())
-            _ = g.create_dataset('kernels_imag', self.kernels_imag.numpy())
+            _ = g.create_dataset('kernels_real', self.kernels.numpy().real())
+            _ = g.create_dataset('kernels_imag', self.kernels.numpy().imag())
             _ = g.create_dataset('dt_weights', self.dt_weights.numpy())
 
     @classmethod
@@ -846,16 +1196,17 @@ class Convolution1DTransform(BaseTransform):
             
         obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high)
 
-        obj.kernels_real = tf.Variable(kernels_real, dtype=tf.float32,
-                                       trainable=True, constraint=self.normalise)
-        obj.kernels_imag = tf.Variable(kernels_imag, dtype=tf.float32,
-                                       trainable=True, constraint=self.normalise)
+        kernels_real = tf.convert_to_tensor(kernels_real, dtype=tf.float32)
+        kernels_imag = tf.convert_to_tensor(kernels_imag, dtype=tf.float32)
+        kernels = tf.complex(kernels_real, kernels_imag)
+        obj.kernels = tf.Variable(kernels,
+                                  dtype=tf.complex64, trainable=True,
+                                  constraint=obj.normalise)
 
         obj.dt_weights = tf.Variable(dt_weights, dtype=tf.float32, trainable=True)
 
-        obj.trainable_weights = {'kernel_real': obj.kernels_real,
-                                 'kernel_imag': obj.kernels_imag,
-                                 'dt': obj.dt_weights}
+        obj.trainable_weights = {'kernels': obj.kernels,
+                                 'dt_weights': obj.dt_weights}
         return obj
 
     def plot_model(self, bank, title=None):
@@ -887,82 +1238,6 @@ class Convolution1DTransform(BaseTransform):
         return fig, ax
 
 
-class ChisqFilter(MatchedFilter):
-
-    def __init__(self, transform, threshold, freqs, f_low, f_high):
-        super().__init__(freqs, f_low, f_high)
-        self.transform = transform
-        self.threshold = threshold
-
-    def get_max_idx(self, data, gather_idxs=None):
-        if gather_idxs is not None:
-            data = tf.gather_nd(data, gather_idxs)
-        max_data_idx = tf.math.argmax(data, axis=-1)
-
-        max_data_gather = tf.stack([tf.range(tf.shape(max_data_idx)[0], dtype=tf.int64),
-                                    max_data_idx], axis=-1)
-
-        if gather_idxs is not None:
-            max_data_idx = max_data_idx + gather_idxs[:, 0, 1]
-
-        max_data = tf.gather_nd(data, max_data_gather)
-        return max_data, max_data_idx
-
-    def get_max_snr(self, temp, segs, psds, gather_idxs=None):
-        snr, _ = self.matched_filter(temp, segs, psds)
-        snr = snr[:, 0, :]
-        max_snr, max_snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
-        return max_snr, max_snr_idx
-
-    def get_max_snr_prime(self, temp, segs, psds, params,
-                          gather_idxs=None, max_snr=False, **kwargs):
-
-        chi_temps = self.transform.transform(temp, params, **kwargs)
-        logging.info("Templates transformed")
-
-        chi_orthos, ortho_lgc = self.transform.get_ortho(chi_temps, temp, psds)
-        logging.info("Orthogonal templates created")
-
-        snr, _ = self.matched_filter(temp, segs, psds)
-        snr = snr[:, 0, :]
-        snr_idx = None
-        if max_snr:
-            snr, snr_idx = self.get_max_snr(temp, segs, psds, gather_idxs=gather_idxs)
-        elif gather_idxs is not None:
-            snr = tf.gather_nd(snr, gather_idxs)
-
-        chis, match_lgc = self.matched_filter(chi_orthos, segs, psds, idx=snr_idx)
-
-        lgc = tf.math.logical_and(ortho_lgc, match_lgc)
-        mask = tf.cast(lgc, tf.float32)
-        if max_snr:
-            mask = mask[:, :, 0]
-        ortho_num = tf.reduce_sum(mask, axis=1)
-        ortho_num = tf.math.maximum(ortho_num, tf.ones_like(ortho_num))
-
-        chis = chis * tf.stop_gradient(mask)
-        logging.info("SNRs calculated")
-
-        chisq = tf.math.reduce_sum(chis ** 2., axis=1)
-
-        if (not max_snr) and (gather_idxs is not None):
-            chisq = tf.gather_nd(chisq, gather_idxs)
-
-        rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
-
-        chisq_thresh = rchisq / self.threshold
-        chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
-
-        snr_prime = snr / chisq_thresh ** 0.5
-
-        if not max_snr:
-            snr_prime, max_idx = self.get_max_idx(snr_prime)
-            gather_max = tf.stack([tf.range(len(max_idx), dtype=tf.int64), max_idx], axis=-1)
-            chisq_thresh = tf.gather_nd(chisq_thresh, gather_max)
-        logging.info("SNR' calculated")
-        return snr_prime, chisq_thresh
-
-
 def select_transformation(transformation_key):
     options = {
         'polyshift': PolyShiftTransform,
@@ -975,3 +1250,13 @@ def select_transformation(transformation_key):
 
     raise ValueError("{0} is not a valid transformation, select from {1}".format(transformation_key, options.keys()))
 
+
+def load_transformation(file_path, freqs, f_low, f_high, group=None):
+    with h5py.File(file_path, 'r') as f:
+        if group:
+            g = f[group]
+        else:
+            g = f
+        transformation_type = g.attrs["transformation_type"]
+    transformation_class = select_transformation(transformation_type)
+    return transformation_class.from_file(file_path, freqs, f_low, f_high, group=group)

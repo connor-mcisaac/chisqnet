@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 from pycbc import waveform
 from pycbc.types import zeros, float32, complex64
-from chisqnet.filtering import select_transformation, ChisqFilter
+from chisqnet.filtering import ChisqFilter
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
@@ -66,12 +66,8 @@ parser.add_argument("--l2-weight", default=0.01, type=float,
                     help="The l2 regulariser weight")
 
 # Gather arguments for transform
-parser.add_argument("--transformation", required=True,
-                    help="The type of transformation to be used")
 parser.add_argument("--config-file", required=True,
                     help="The config gile used to create the transformation")
-parser.add_argument("--threshold-max", required=True, type=float,
-                    help="The maximum value the chisquared threshold can take")
 
 # Gather inputs for output
 parser.add_argument("--output-file", required=True,
@@ -111,47 +107,28 @@ bank = waveform.FilterBank(
 
 freqs = np.arange(training_samples.flen) * training_samples.delta_f
 
-clip = lambda x: tf.clip_by_value(x, 1., args.threshold_max)
-
-transform_class = select_transformation(args.transformation)
-
 if args.checkpoint_file is None:
     epoch = 0
-    transform = transform_class.from_config(
+    chisq_transform = ChisqFilter.from_config(
         args.config_file,
         freqs, training_samples.flow,
         training_samples.sample_rate // 2
     )
-
-    threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
-                            dtype=tf.float32, constraint=clip)
-
 else:
     with h5py.File(args.checkpoint_file, 'r') as f:
         epoch = f.attrs['epoch']
-        thresh = f['thresh_epoch_{0}'.format(epoch)][0]
         g = f['optimizer_epoch_{0}'.format(epoch)]
         opt_weights = [g['weight_{0}'.format(i)][()]
                        for i in range(g.attrs['weights_num'])]
 
-    transform = transform_class.from_file(
+    chisq_transform = ChisqFilter.from_file(
         args.checkpoint_file,
         freqs, training_samples.flow,
         training_samples.sample_rate // 2,
         group="model_epoch_{0}".format(epoch)
     )
-    
-    threshold = tf.Variable(np.array([thresh], dtype=np.float32), trainable=True,
-                            dtype=tf.float32, constraint=clip)
 
-chisq_transform = ChisqFilter(
-    transform, threshold,
-    freqs, training_samples.flow, training_samples.sample_rate // 2
-)
-
-train = transform.trainable_weights
-train['thresh'] = threshold
-
+train = chisq_transform.trainable_weights
 trainable_names = [k for k in train.keys()]
 trainable_names.sort()
 trainable_weights = [train[k] for k in trainable_names]
@@ -266,7 +243,7 @@ for i in range(args.epochs):
               end=end_str)
 
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
-        transform.to_file(
+        chisq_transform.to_file(
             args.output_file,
             group="model_epoch_{0}".format(epoch + i + 1),
             append=output_file_created
