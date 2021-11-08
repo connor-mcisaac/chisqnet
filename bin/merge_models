@@ -44,7 +44,7 @@ for fp in args.model_files:
 file_data.concatenate_datasets()
 training_losses = []
 validation_losses = []
-for i in range(epochs):
+for i in range(epoch):
     training_losses += [file_data.datasets['training_loss_epoch_{0}'.format(i + 1)][:]]
     validation_losses += [file_data.datasets['validation_loss_epoch_{0}'.format(i + 1)][:]]
 training_losses = np.concatenate(training_losses, axis=0)
