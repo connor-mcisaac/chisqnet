@@ -4,7 +4,7 @@ import sys
 import argparse
 import h5py
 import numpy as np
-from chisqnet.filtering import select_transformation
+from chisqnet.filtering import ChisqFilter
 from pycbc import waveform
 import tensorflow as tf
 import pycbc.results
@@ -18,28 +18,22 @@ parser.add_argument("--model-file", required=True,
 parser.add_argument("--bank-file", required=True,
                     help="File containing bank to be plotted")
 
-parser.add_argument("--transformation", required=True,
-                    help="The type of transformation to be used")
-
 parser.add_argument("--output-file", required=True,
                     help="Location of the output file")
 
 args = parser.parse_args()
 
-transform_class = select_transformation(args.transformation)
-
 with h5py.File(args.model_file, 'r') as f:
      epoch = f.attrs['epoch']
-     thresh = f['thresh_epoch_{0}'.format(epoch)][0]
 
-transform = transform_class.from_file(
+chisq_transform = ChisqFilter.from_file(
      args.model_file,
      np.arange(10), 1., 10.,
      group="model_epoch_{0}".format(epoch)
 )
 
 bank = waveform.TemplateBank(args.bank_file)
-fig, ax = transform.plot_model(bank, title="threshold = {0:.4f}".format(thresh))
+fig, ax = chisq_transform.transform.plot_model(bank)
 
 caption = "This is a plot of the trained model after all training is complete."
 

@@ -60,10 +60,6 @@ parser.add_argument("--snr-cut-width", default=0.1, type=float,
                     help="The width around each trigger to cut from the SNR timeseries")
 parser.add_argument("--learning-rate", default=0.001, type=float,
                     help="The learning rate passed to the training optimizer")
-parser.add_argument("--l1-weight", default=0.01, type=float,
-                    help="The l1 regulariser weight")
-parser.add_argument("--l2-weight", default=0.01, type=float,
-                    help="The l2 regulariser weight")
 
 # Gather arguments for transform
 parser.add_argument("--config-file", required=True,
@@ -194,21 +190,7 @@ for i in range(args.epochs):
             batch_loss = tf.where(injs, inj_loss, trig_loss)
             loss = tf.reduce_mean(batch_loss)
 
-            if args.l1_weight or args.l2_weight:
-                l1_l2_losses = []
-                for n, w in zip(trainable_names, trainable_weights):
-                    if n == 'thresh':
-                        continue
-                    l1_loss = 0.
-                    l2_loss = 0.
-                    if args.l1_weight:
-                        l1_loss = args.l1_weight * tf.reduce_sum(tf.math.abs(w)) / nbatches
-                    if args.l2_weight:
-                        l2_loss = args.l2_weight * tf.reduce_sum(tf.math.square(w)) / nbatches
-                    l1_l2_losses.append(l1_loss + l2_loss)
-                l1_l2_loss = tf.math.add_n(l1_l2_losses)
-                loss += l1_l2_loss
-                    
+            loss += chisq_transform.get_regulariser_loss()
             logging.info("Loss calculated")
 
         gradients = tape.gradient(loss, trainable_weights, unconnected_gradients='none')
@@ -251,13 +233,13 @@ for i in range(args.epochs):
 
         opt_weights = optimizer.get_weights()
         with h5py.File(args.output_file, 'a') as f:
+            f.attrs['epoch'] = epoch + i + 1
             g = f.create_group('optimizer_epoch_{0}'.format(epoch + i + 1))
             g.attrs['weights_num'] = len(opt_weights)
             for j in range(len(opt_weights)):
                 opt = opt_weights[j]
                 _ = g.create_dataset('weight_{0}'.format(j), data=opt)
             _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
-            _ = f.create_dataset('thresh_epoch_{0}'.format(epoch + i + 1), data=threshold.numpy())
 
         output_file_created = True
 

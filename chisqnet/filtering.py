@@ -162,6 +162,12 @@ class MatchedFilter(BaseFilter):
 class BaseTransform(BaseFilter):
     transformation_type = "base"
 
+    def __init__(self, freqs, f_low, f_high, l1_reg=0., l2_reg=0.):
+        super().__init__(freqs, f_low, f_high)
+        self.l1_reg = l1_reg
+        self.l2_reg = l2_reg
+        self.trainable_weights = {}
+
     @tf.function
     @add_temp_axis
     def get_ortho(self, temp, base, psd,
@@ -217,13 +223,29 @@ class BaseTransform(BaseFilter):
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
+    def get_regulariser_loss(self):
+        losses = []
+        for n, w in self.trainable_weights.items():
+            l1_loss = 0.
+            l2_loss = 0.
+            if self.l1_reg:
+                l1_loss = self.l1_reg * tf.reduce_sum(tf.math.abs(w))
+            if self.l2_reg:
+                l2_loss = self.l2_reg * tf.reduce_sum(tf.math.square(w))
+            losses.append(l1_loss + l2_loss)
+        loss = tf.math.add_n(losses)
+        return loss
+
 
 class TemplateMixer(object):
 
     def __init__(self, templates_in, templates_out, layer_sizes,
-                 params, params_base):
+                 params, params_base, l1_reg=0., l2_reg=0.):
         self.templates_in = templates_in
         self.templates_out = templates_out
+
+        self.l1_reg = l1_reg
+        self.l2_reg = l2_reg
         
         if isinstance(params, list):
             self.params = params
@@ -265,9 +287,7 @@ class TemplateMixer(object):
             values = tf.convert_to_tensor(params[:].astype(np.float32), dtype=tf.float32)
             for w, b in zip(ws[:-1], bs[:-1]):
                 values = tf.matmul(values, w) + b
-                values = tf.math.sigmoid(values)
-                if training:
-                    values = tf.nn.dropout(values, 0.25)
+                values = tf.nn.relu(values)
             values = tf.matmul(values, ws[-1]) + bs[-1]
             values = 1e-6 + (1 - 1e-6) * tf.math.sigmoid(values)
             if training:
@@ -299,9 +319,12 @@ class TemplateMixer(object):
         layer_sizes = [int(l) for l in config.get(section, "layer-sizes").split(',')]
         params = config.get(section, "params").split(',')
         params_base = [float(p) for p in config.get(section, "params-base").split(',')]
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
+
 
         obj = cls(templates_in, templates_out, layer_sizes,
-                  params, params_base)
+                  params, params_base, l1_reg=l1_reg, l2_reg=l2_reg)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -325,6 +348,8 @@ class TemplateMixer(object):
                                          data=self.weights[i][j].numpy())
                     _ = g.create_dataset("net_{0}_bias_{1}".format(i, j),
                                          data=self.biases[i][j].numpy())
+            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
+            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
 
     @classmethod
     def from_file(cls, file_path, group=None):
@@ -341,12 +366,14 @@ class TemplateMixer(object):
                        for i in range(templates_out)]
             biases = [[g["net_{0}_bias_{1}".format(i, j)][:] for j in range(num)]
                       for i in range(templates_out)]
+            l1_reg = g['l1_reg'][0]
+            l2_reg = g['l2_reg'][0]
 
         if isinstance(params[0], bytes):
             params = [p.decode() for p in params]
 
         obj = cls(1, templates_out, [],
-                  params, params_base)
+                  params, params_base, l1_reg=l1_reg, l2_reg=l2_reg)
 
         obj.weights = [[tf.Variable(w, trainable=True, dtype=tf.float32) for w in ws]
                        for ws in weights]
@@ -392,6 +419,19 @@ class TemplateMixer(object):
             fig.suptitle(title, fontsize="large")
 
         return fig, ax
+
+    def get_regulariser_loss(self):
+        losses = []
+        for n, w in self.trainable_weights.items():
+            l1_loss = 0.
+            l2_loss = 0.
+            if self.l1_reg:
+                l1_loss = self.l1_reg * tf.reduce_sum(tf.math.abs(w))
+            if self.l2_reg:
+                l2_loss = self.l2_reg * tf.reduce_sum(tf.math.square(w))
+            losses.append(l1_loss + l2_loss)
+        loss = tf.math.add_n(losses)
+        return loss
 
 
 class ChisqFilter(MatchedFilter):
@@ -519,9 +559,10 @@ class ChisqFilter(MatchedFilter):
 
         if group is None:
             group = ''
-        self.transform.to_file(file_path, group=group + '/transform', append=append)
-        self.mixer.to_file(file_path, group=group + '/mixer', append=append)
-        
+        self.transform.to_file(file_path, group=group + '/transform', append=True)
+        if self.mixer:
+            self.mixer.to_file(file_path, group=group + '/mixer', append=True)
+
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
         with h5py.File(file_path, 'r') as f:
@@ -531,13 +572,13 @@ class ChisqFilter(MatchedFilter):
                 g = f
             threshold_max = g["threshold_max"][0]
             threshold = g["threshold"][0]
-            if (group + '/mixer') in g.keys():
+            if 'mixer' in g.keys():
                 mixer_check = True
             else:
                 mixer_check = False
 
         transform = load_transformation(file_path, freqs, f_low, f_high,
-                                        group=group + 'transform')
+                                        group=group + '/transform')
         if mixer_check:
             mixer = TemplateMixer.from_file(file_path, group=group + '/mixer')
         else:
@@ -548,15 +589,15 @@ class ChisqFilter(MatchedFilter):
 
         obj.threshold = tf.Variable(np.array([threshold], dtype=np.float32), trainable=True,
                                     dtype=tf.float32, constraint=obj.clip)
-        obj.trainable_weights = {}
-        for k, v in obj.transform.trainable_weights.items():
-            obj.trainable_weights[k] = v
-        if obj.mixer:
-            for k, v in obj.mixer.trainable_weights.items():
-                obj.trainable_weights[k] = v
-        obj.traiable_weights['threshold'] = obj.threshold
+        obj.trainable_weights['threshold'] = obj.threshold
 
         return obj
+
+    def get_regulariser_loss(self):
+        loss = self.transform.get_regulariser_loss()
+        if self.mixer:
+            loss += self.mixer.get_regulariser_loss()
+        return loss
 
 
 class ShiftTransform(BaseTransform):
@@ -650,9 +691,9 @@ class PolyShiftTransform(ShiftTransform):
     transformation_type = "polyshift"
 
     def __init__(self, nshifts, degree, dt_base, df_base, param, param_base,
-                 freqs, f_low, f_high, offset=None):
+                 freqs, f_low, f_high, offset=None, l1_reg=0., l2_reg=0.):
 
-        super().__init__(freqs, f_low, f_high)
+        super().__init__(freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
         if degree < 0:
             raise ValueError("degree must be >= 0")
@@ -721,9 +762,12 @@ class PolyShiftTransform(ShiftTransform):
         param = config.get(section, "shift-param")
         param_base = config.getfloat(section, "shift-param-base")
         offset = config.getfloat(section, "offset", fallback=None)
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
 
         obj = cls(nshifts, degree, dt_base, df_base, param, param_base,
-                  freqs, f_low, f_high, offset=offset)
+                  freqs, f_low, f_high, offset=offset,
+                  l1_reg=l1_reg, l2_reg=l2_reg)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -746,7 +790,9 @@ class PolyShiftTransform(ShiftTransform):
             _ = g.create_dataset("param_base", data=np.array([self.param_base]))
             _ = g.create_dataset("dt_shift", data=self.dt_shift.numpy())
             _ = g.create_dataset("df_shift", data=self.df_shift.numpy())
-        
+            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
+            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
+
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
         with h5py.File(file_path, 'r') as f:
@@ -762,12 +808,14 @@ class PolyShiftTransform(ShiftTransform):
             param_base = g["param_base"][0]
             dt_shift = g["dt_shift"][:]
             df_shift = g["df_shift"][:]
+            l1_reg = g["l1_reg"][0]
+            l2_reg = g["l2_reg"][0]
 
         if isinstance(param, bytes):
             param = param.decode()
 
         obj = cls(nshifts, degree, dt_base, df_base, param, param_base,
-                  freqs, f_low, f_high)
+                  freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
         obj.dt_shift = tf.Variable(dt_shift, trainable=True, dtype=tf.float32)
         obj.df_shift = tf.Variable(df_shift, trainable=True, dtype=tf.float32)
@@ -812,9 +860,9 @@ class NetShiftTransform(ShiftTransform):
     transformation_type = "netshift"
 
     def __init__(self, nshifts, layer_sizes, dt_max, df_max, params, params_base,
-                 freqs, f_low, f_high):
+                 freqs, f_low, f_high, l1_reg=0., l2_reg=0.):
 
-        super().__init__(freqs, f_low, f_high)
+        super().__init__(freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
         self.nshifts = nshifts
 
@@ -891,9 +939,11 @@ class NetShiftTransform(ShiftTransform):
         df_max = config.getfloat(section, "max-freq-shift")
         params = config.get(section, "shift-params").split(',')
         params_base = [float(p) for p in config.get(section, "shift-params-base").split(',')]
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
 
         obj = cls(nshifts, layer_sizes, dt_max, df_max, params, params_base,
-                  freqs, f_low, f_high)
+                  freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -920,6 +970,8 @@ class NetShiftTransform(ShiftTransform):
                                          data=self.weights[i][j].numpy())
                     _ = g.create_dataset("net_{0}_bias_{1}".format(i, j),
                                          data=self.biases[i][j].numpy())
+            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
+            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -938,12 +990,14 @@ class NetShiftTransform(ShiftTransform):
                        for i in range(nshifts)]
             biases = [[g["net_{0}_bias_{1}".format(i, j)][:] for j in range(num)]
                       for i in range(nshifts)]
+            l1_reg = g["l1_reg"][0]
+            l2_reg = g["l2_reg"][0]
 
         if isinstance(params[0], bytes):
             params = [p.decode() for p in params]
 
         obj = cls(nshifts, [], dt_max, df_max, params, params_base,
-                  freqs, f_low, f_high)
+                  freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
         obj.weights = [[tf.Variable(w, trainable=True, dtype=tf.float32) for w in ws]
                        for ws in weights]
@@ -1033,9 +1087,10 @@ class Convolution1DTransform(BaseTransform):
     def clip(self, x):
         return tf.clip_by_value(x, - self.max_dt, self.max_dt)
 
-    def __init__(self, nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high):
+    def __init__(self, nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high,
+                 l1_reg=0., l2_reg=0.):
         
-        super().__init__(freqs, f_low, f_high)
+        super().__init__(freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
         self.nkernel = nkernel
         self.kernel_df = kernel_df
@@ -1134,7 +1189,7 @@ class Convolution1DTransform(BaseTransform):
         ctemp_imag += tf.nn.conv2d(temp_real, kernels_imag, 1, padding, data_format='NHWC')
 
         ctemp = tf.complex(ctemp_real, ctemp_imag)
-        ctemp = tf.squeeze(ctemp)
+        ctemp = ctemp[:, 0, :, :]
         ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
 
         div = tf.convert_to_tensor(self.conv_half_width * 2 + 1, dtype=tf.complex64)
@@ -1155,8 +1210,11 @@ class Convolution1DTransform(BaseTransform):
         kernel_df = config.getfloat(section, 'delta-f')
         max_df = config.getfloat(section, 'frequency-width')
         max_dt = config.getfloat(section, 'max-time-shift')
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
 
-        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high)
+        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high,
+                  l1_reg=l1_reg, l2_reg=l2_reg)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -1171,13 +1229,15 @@ class Convolution1DTransform(BaseTransform):
             else:
                 g = f
             g.attrs['transformation_type'] = self.transformation_type
-            _ = g.create_dataset('nkernel', np.array([self.nkernel]))
-            _ = g.create_dataset('kernel_df', np.array([self.kernel_df]))
-            _ = g.create_dataset('max_df', np.array([self.max_df]))
-            _ = g.create_dataset('max_dt', np.array([self.max_dt]))
-            _ = g.create_dataset('kernels_real', self.kernels.numpy().real())
-            _ = g.create_dataset('kernels_imag', self.kernels.numpy().imag())
-            _ = g.create_dataset('dt_weights', self.dt_weights.numpy())
+            _ = g.create_dataset('nkernel', data=np.array([self.nkernel]))
+            _ = g.create_dataset('kernel_df', data=np.array([self.kernel_df]))
+            _ = g.create_dataset('max_df', data=np.array([self.max_df]))
+            _ = g.create_dataset('max_dt', data=np.array([self.max_dt]))
+            _ = g.create_dataset('kernels_real', data=self.kernels.numpy().real)
+            _ = g.create_dataset('kernels_imag', data=self.kernels.numpy().imag)
+            _ = g.create_dataset('dt_weights', data=self.dt_weights.numpy())
+            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
+            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -1188,13 +1248,16 @@ class Convolution1DTransform(BaseTransform):
                 g = f
             nkernel = g['nkernel'][0]
             kernel_df = g['kernel_df'][0]
-            max_df = f['max_df'][0]
+            max_df = g['max_df'][0]
             max_dt = g['max_dt'][0]
             kernels_real = g['kernels_real'][:]
             kernels_imag = g['kernels_imag'][:]
             dt_weights = g['dt_weights'][:]
-            
-        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high)
+            l1_reg = g["l1_reg"][0]
+            l2_reg = g["l2_reg"][0]
+
+        obj = cls(nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high,
+                  l1_reg=l1_reg, l2_reg=l2_reg)
 
         kernels_real = tf.convert_to_tensor(kernels_real, dtype=tf.float32)
         kernels_imag = tf.convert_to_tensor(kernels_imag, dtype=tf.float32)
