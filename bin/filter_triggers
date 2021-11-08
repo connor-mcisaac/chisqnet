@@ -42,6 +42,12 @@ parser.add_argument("--cluster-param",
                     help="Parameter to use when clustering triggers")
 parser.add_argument("--cluster-window", type=float,
                     help="Window in seconds to use when clustering triggers")
+parser.add_argument("--cluster-keep-top-n", type=int, default=1,
+                    help="If greater than one, run clustering this many times, "
+                         "removing previous triggers after each step")
+parser.add_argument("--keep-n-triggers", type=int,
+                    help="After all other clustering randomly select this many triggers")
+
 
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
@@ -106,11 +112,15 @@ for k, v in triggers.nums.items():
     logging.info("{0}: {1}".format(k, v))
 
 if args.cluster_param and args.cluster_window:
-    triggers.cluster_over_time(args.cluster_window, args.cluster_param)
+    triggers.cluster_over_time(args.cluster_window, args.cluster_param,
+                               keep_top=args.cluster_keep_top_n)
 
 logging.info("Triggers available after clustering:")
 for k, v in triggers.nums.items():
     logging.info("{0}: {1}".format(k, v))
+
+if args.keep_n_triggers:
+    triggers.sample(args.keep_n_triggers)
 
 triggers.get_bank_params(args.bank_file)
 
