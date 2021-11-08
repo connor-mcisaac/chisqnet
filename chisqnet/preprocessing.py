@@ -139,14 +139,18 @@ class TriggerList(object):
             self.triggers[ifo] = self.triggers[ifo][lgc]
             self.nums[ifo] = np.sum(lgc)
 
-    def cluster_over_time(self, window, param):
-
+    def cluster_over_time(self, window, param, keep_top=1):
         for ifo in self.ifos:
-            idxs = cluster_over_time(self.triggers[ifo][param],
-                                     self.triggers[ifo]['end_time'],
-                                     window)
-            self.triggers[ifo] = self.triggers[ifo][idxs]
-            self.nums[ifo] = len(idxs)
+            triggers = np.copy(self.triggers[ifo])
+            keep = []
+            for i in range(keep_top):
+                idxs = cluster_over_time(triggers[param],
+                                         triggers['end_time'],
+                                         window)
+                keep += [triggers[idxs]]
+                triggers = np.delete(triggers, idxs)
+            self.triggers[ifo] = np.concatenate(keep)
+            self.nums[ifo] = len(self.triggers[ifo])
 
     def get_bank_params(self, bank_file):
 
@@ -269,6 +273,19 @@ class TriggerList(object):
                                                  triggers.triggers[ifo][common]])
             self.nums[ifo] = len(self.triggers[ifo])
 
+    def sample(self, num):
+        ifos = np.concatenate([np.array([ifo] * self.nums[ifo]) for ifo in self.ifos])
+        idxs = np.concatenate([np.arange(self.nums[ifo]) for ifo in self.ifos])
+        total = len(idxs)
+        if total < num:
+            return
+        keep = np.random.choice(total, size=num, replace=False)
+        ifos = ifos[keep]
+        idxs = idxs[keep]
+        for ifo in self.ifos:
+            ifo_idxs = idxs[ifos == ifo]
+            self.triggers[ifo] = self.triggers[ifo][ifo_idxs]
+            self.nums[ifo] = len(ifo_idxs)
 
 class InjectionTriggers(TriggerList):
     
