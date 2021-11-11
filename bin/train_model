@@ -54,12 +54,16 @@ parser.add_argument("--batch-size", required=True, type=int,
                     help="The number of samples to analyse in one batch")
 parser.add_argument("--epochs", required=True, type=int,
                      help="The number of times to analyse the full dataset")
+parser.add_argument("--batches-per-step", type=int,
+                    help="The number of batches to run before running validation")
 parser.add_argument("--shuffle", action="store_true",
                     help="If given, shuffle the order of analysed segments each epoch")
 parser.add_argument("--snr-cut-width", default=0.1, type=float,
                     help="The width around each trigger to cut from the SNR timeseries")
 parser.add_argument("--learning-rate", default=0.001, type=float,
                     help="The learning rate passed to the training optimizer")
+parser.add_argument("--learning-rate-decay", default=1., type=float,
+                    help="The value to multiply the learning rate by after each step")
 
 # Gather arguments for transform
 parser.add_argument("--config-file", required=True,
@@ -136,6 +140,9 @@ if args.checkpoint_file is not None:
     optimizer.apply_gradients(zip(grads, trainable_weights))
     optimizer.set_weights(opt_weights)
 
+nbatches = int(np.ceil(1. * training_samples.num / args.batch_size))
+nbatch = epoch * nbatches
+
 output_file_created = False
 
 for i in range(args.epochs):
@@ -146,19 +153,34 @@ for i in range(args.epochs):
     order = np.arange(training_samples.num)
     if args.shuffle:
         np.random.shuffle(order)
-
-    nbatches = int(np.ceil(1. * training_samples.num / args.batch_size))
-
+    
     losses = []
+    batches = []
 
-    inj_losses = 0.
-    inj_count = 0
-    trig_losses = 0.
-    trig_count = 0
+    inj_losses = []
+    inj_count = []
+    inj_epoch = 0
+
+    trig_losses = []
+    trig_count = []
+    trig_epoch = 0
+
+    snr_removed = []
 
     times = 0.
 
+    val_losses = []
+    val_batches = []
+
+    val_inj_losses = []
+    val_trig_losses = []
+
+    val_snr_removeds = []
+
     for j in range(nbatches):
+
+        nstep = nbatch // args.batches_per_step
+        optimizer.learning_rate = args.learning_rate * args.learning_rate_decay ** (nstep)
 
         lidx = int(1. * j * training_samples.num / nbatches)
         hidx = int(1. * (j + 1) * training_samples.num / nbatches)
@@ -184,8 +206,8 @@ for i in range(args.epochs):
             )
 
             snr = snr_prime * (chisq ** 0.5)
-            trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.) ** 2.
-            inj_loss = (snr - snr_prime) ** 2.
+            trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.)
+            inj_loss = (snr - snr_prime)
 
             batch_loss = tf.where(injs, inj_loss, trig_loss)
             loss = tf.reduce_mean(batch_loss)
@@ -201,28 +223,129 @@ for i in range(args.epochs):
         logging.info("Completed batch")
 
         losses += [loss]
+        batches += [nbatch]
 
         inj_lgc = injs.numpy()
         trig_lgc = np.logical_not(inj_lgc)
-        inj_losses += np.sum(batch_loss.numpy()[inj_lgc])
-        inj_count += np.sum(inj_lgc)
-        trig_losses += np.sum(batch_loss.numpy()[trig_lgc])
-        trig_count += np.sum(trig_lgc)
+
+        inj_count += [np.sum(inj_lgc)]
+        trig_count += [np.sum(trig_lgc)]
+
+        inj_epoch += np.sum(inj_lgc)
+        trig_epoch += np.sum(trig_lgc)
+
+        inj_losses += [np.sum(batch_loss.numpy()[inj_lgc])]
+        trig_losses += [np.sum(batch_loss.numpy()[trig_lgc])]
+
+        snr_above = (tf.maximum(snr, tf.ones_like(snr) * 4.) - 4.) + 1e-7
+        snr_removed += [np.sum(1 - (trig_loss / snr_above).numpy()[trig_lgc])]
 
         times += time.time() - start
 
-        if j == (nbatches - 1):
+        nbatch += 1
+
+        if j == (nbatches - 1) or (nbatch % args.batches_per_step) == 0:
             end_str = '\n'
         else:
             end_str = '\r'
 
-        print("Epoch: {0:5d}/{1:5d} ".format(i + 1, args.epochs)
-              + "Batch: {0:5d}/{1:5d}, ".format(j + 1, nbatches)
-              + "Av. Loss: {0:6.6f}, ".format(np.sum(losses) / (j + 1))
-              + "Av. Inj Loss: {0:6.6f}, ".format(inj_losses / inj_count)
-              + "Av. Trig Loss: {0:6.6f}, ".format(trig_losses / trig_count)
+        print("Epoch: {0:3d}/{1:3d} ".format(i + 1, args.epochs)
+              + "Batch: {0:4d}/{1:4d}, ".format(j + 1, nbatches)
+              + "Av. Loss: {0:3.4f}, ".format(np.sum(losses) / (j + 1))
+              + "Av. Inj Loss: {0:3.4f}, ".format(np.sum(inj_losses) / max(np.sum(inj_count), 1))
+              + "Av. Trig Loss: {0:3.4f}, ".format(np.sum(trig_losses) / max(np.sum(trig_count), 1))
+              + "Av. Trig SNR Frac Removed: {0:1.4f}, ".format(np.sum(snr_removed) / max(np.sum(trig_count), 1))
               + "Av. Time: {0:6.2f}".format(times / (j + 1)),
               end=end_str)
+
+        if (args.validation_sample_file is None) \
+                or ((nbatch % args.batches_per_step) != 0 and (j + 1) != nbatches):
+            continue
+
+        logging.info("Starting validation")
+        val_order = np.arange(validation_samples.num)
+        val_nbatches = int(np.ceil(1. * validation_samples.num / args.batch_size))
+
+        val_loss = 0.
+
+        val_inj_count = 0
+        val_trig_count = 0
+
+        val_inj_loss = 0.
+        val_trig_loss = 0.
+
+        val_snr_removed = 0.
+
+        val_times = 0.
+
+        for k in range(val_nbatches):
+
+            lidx = int(1. * k * validation_samples.num / val_nbatches)
+            hidx = int(1. * (k + 1) * validation_samples.num / val_nbatches)
+
+            idxs = order[lidx:hidx]
+            idxs = np.sort(idxs)
+
+            logging.info("Starting batch")
+
+            start = time.time()
+
+            segs, psds, temp, injs, gather_idxs, params = \
+                validation_samples.get_tensors(idxs, bank)
+
+            logging.info("Batch inputs read")
+
+            snr_prime, chisq = chisq_transform.get_max_snr_prime(
+                temp, segs, psds, params,
+                gather_idxs=gather_idxs,
+                max_snr=True, training=False
+            )
+
+            snr = snr_prime * (chisq ** 0.5)
+            trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.)
+            inj_loss = (snr - snr_prime)
+
+            batch_loss = tf.where(injs, inj_loss, trig_loss)
+            val_loss += tf.reduce_sum(batch_loss)
+
+            logging.info("Loss calculated")
+            logging.info("Completed batch")
+
+            inj_lgc = injs.numpy()
+            trig_lgc = np.logical_not(inj_lgc)
+
+            val_inj_count += np.sum(inj_lgc)
+            val_trig_count += np.sum(trig_lgc)
+            total_count = val_inj_count + val_trig_count
+
+            val_inj_loss += np.sum(batch_loss.numpy()[inj_lgc])
+            val_trig_loss += np.sum(batch_loss.numpy()[trig_lgc])
+
+            snr_above = (tf.maximum(snr, tf.ones_like(snr) * 4.) - 4.) + 1e-7
+            val_snr_removed += np.sum(1 - (trig_loss / snr_above).numpy()[trig_lgc])
+
+            val_times += time.time() - start
+
+            if k == (val_nbatches - 1):
+                end_str = '\n'
+            else:
+                end_str = '\r'
+                
+            print("Batch: {0:4d}/{1:4d}, ".format(k + 1, val_nbatches)
+                  + "Av. Loss: {0:3.4f}, ".format(val_loss / total_count)
+                  + "Av. Inj Loss: {0:3.4f}, ".format(val_inj_loss / max(val_inj_count, 1))
+                  + "Av. Trig Loss: {0:3.4f}, ".format(val_trig_loss / max(val_trig_count, 1))
+                  + "Av. Trig SNR Frac Removed: {0:1.4f}, ".format(val_snr_removed / max(val_trig_count, 1))
+                  + "Av. Time: {0:6.2f}".format(val_times / (k + 1)),
+                  end=end_str)
+
+        val_losses += [val_loss / total_count]
+        val_batches += [nbatch]
+
+        val_inj_losses += [val_inj_loss / val_inj_count]
+        val_trig_losses += [val_trig_loss / val_trig_count]
+
+        val_snr_removeds += [val_snr_removed / val_trig_count]
 
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
         chisq_transform.to_file(
@@ -239,82 +362,27 @@ for i in range(args.epochs):
             for j in range(len(opt_weights)):
                 opt = opt_weights[j]
                 _ = g.create_dataset('weight_{0}'.format(j), data=opt)
-            _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
 
         output_file_created = True
 
-    if args.validation_sample_file is None:
-        continue
+    inj_losses = np.array(inj_losses) / np.maximum(np.array(inj_count), 1)
+    trig_losses = np.array(trig_losses) / np.maximum(np.array(trig_count), 1)
+    snr_removed = np.array(snr_removed) / np.maximum(np.array(trig_count), 1)
 
-    logging.info("Starting validation")
-    order = np.arange(validation_samples.num)
-    nbatches = int(np.ceil(1. * validation_samples.num / args.batch_size))
+    with h5py.File(args.output_file, 'a') as f:
+        _ = f.create_dataset('training_batch_epoch_{0}'.format(epoch + i + 1), data=np.array(batches))
+        _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
+        _ = f.create_dataset('training_inj_loss_epoch_{0}'.format(epoch + i + 1), data=inj_losses)
+        _ = f.create_dataset('training_trig_loss_epoch_{0}'.format(epoch + i + 1), data=trig_losses)
+        _ = f.create_dataset('training_snr_removed_epoch_{0}'.format(epoch + i + 1), data=snr_removed)
 
-    losses = []
-
-    inj_losses = 0.
-    inj_count = 0
-    trig_losses = 0.
-    trig_count = 0
-
-    times = 0.
-
-    for j in range(nbatches):
-
-        lidx = int(1. * j * validation_samples.num / nbatches)
-        hidx = int(1. * (j + 1) * validation_samples.num / nbatches)
-
-        idxs = order[lidx:hidx]
-        idxs = np.sort(idxs)
-
-        logging.info("Starting batch")
-
-        start = time.time()
-
-        segs, psds, temp, injs, gather_idxs, params = \
-            validation_samples.get_tensors(idxs, bank)
-
-        logging.info("Batch inputs read")
-
-        snr_prime, chisq = chisq_transform.get_max_snr_prime(
-            temp, segs, psds, params,
-            gather_idxs=gather_idxs,
-            max_snr=True, training=False
-        )
-
-        snr = snr_prime * (chisq ** 0.5)
-        trig_loss = (tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.) - 4.) ** 2.
-        inj_loss = (snr - snr_prime) ** 2.
-
-        batch_loss = tf.where(injs, inj_loss, trig_loss)
-        loss = tf.reduce_mean(batch_loss)
-
-        logging.info("Loss calculated")
-        logging.info("Completed batch")
-
-        losses += [loss]
-
-        inj_lgc = injs.numpy()
-        trig_lgc = np.logical_not(inj_lgc)
-        inj_losses += np.sum(batch_loss.numpy()[inj_lgc])
-        inj_count += np.sum(inj_lgc)
-        trig_losses += np.sum(batch_loss.numpy()[trig_lgc])
-        trig_count += np.sum(trig_lgc)
-
-        times += time.time() - start
-
-        if j == (nbatches - 1):
-            end_str = '\n'
-        else:
-            end_str = '\r'
-
-        print("Epoch: {0:5d}/{1:5d} ".format(i + 1, args.epochs)
-              + "Batch: {0:5d}/{1:5d}, ".format(j + 1, nbatches)
-              + "Av. Loss: {0:6.6f}, ".format(np.sum(losses) / (j + 1))
-              + "Av. Inj Loss: {0:6.6f}, ".format(inj_losses / inj_count)
-              + "Av. Trig Loss: {0:6.6f}, ".format(trig_losses / trig_count)
-              + "Av. Time: {0:6.2f}".format(times / (j + 1)),
-              end=end_str)
-
-        with h5py.File(args.output_file, 'a') as f:
-            _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
+        _ = f.create_dataset('validation_batch_epoch_{0}'.format(epoch + i + 1),
+                             data=np.array(val_batches))
+        _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1),
+                             data=np.array(val_losses))
+        _ = f.create_dataset('validation_inj_loss_epoch_{0}'.format(epoch + i + 1),
+                             data=np.array(val_inj_losses))
+        _ = f.create_dataset('validation_trig_loss_epoch_{0}'.format(epoch + i + 1),
+                             data=np.array(val_trig_losses))
+        _ = f.create_dataset('validation_snr_removed_epoch_{0}'.format(epoch + i + 1),
+                             data=np.array(val_snr_removeds))

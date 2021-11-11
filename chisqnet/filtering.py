@@ -517,7 +517,7 @@ class ChisqFilter(MatchedFilter):
 
         if not max_snr:
             snr_prime, max_idx = self.get_max_idx(snr_prime)
-            gather_max = tf.stack([tf.range(len(max_idx), dtype=tf.int64), max_idx], axis=-1)
+            gather_max = tf.stack([tf.range(tf.shape(max_idx)[0], dtype=tf.int64), max_idx], axis=-1)
             chisq_thresh = tf.gather_nd(chisq_thresh, gather_max)
         logging.info("SNR' calculated")
         return snr_prime, chisq_thresh

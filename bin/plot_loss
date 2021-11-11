@@ -19,20 +19,58 @@ parser.add_argument("--output-file", required=True,
 args = parser.parse_args()
 
 with h5py.File(args.input_file, 'r') as f:
-     epochs = f.attrs['epoch']
-     train_loss = f['training_loss'][:]
-     val_loss = [f['validation_loss_epoch_{0}'.format(i + 1)][-1] for i in range(epochs)]
+     training_batch = f['training_batch'][:]
+     training_loss = f['training_loss'][:]
+     training_inj_loss = f['training_inj_loss'][:]
+     training_trig_loss = f['training_trig_loss'][:]
+     training_snr_removed = f['training_snr_removed'][:]
+
+     validation_batch = f['validation_batch'][:]
+     validation_loss = f['validation_loss'][:]
+     validation_inj_loss = f['validation_inj_loss'][:]
+     validation_trig_loss = f['validation_trig_loss'][:]
+     validation_snr_removed = f['validation_snr_removed'][:]
 
 caption = "This is a plot of the loss as it evolves with " \
 	  "the number of batches of training."
 
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.plot(train_loss, linewidth=3, label='training loss', alpha=0.75)
-ax.plot(val_loss, linewidth=3, label='validation loss', alpha=0.75)
-ax.set_xlabel('Batches', fontsize='large')
-ax.set_ylabel('Loss', fontsize='large')
-ax.grid()
-ax.legend()
+fig, ax = plt.subplots(ncols=2, nrows=2, figsize=(18, 12))
+
+ax[0, 0].plot(training_batch, training_loss, alpha=0.75, label='Training Loss')
+ax[0, 0].plot(training_batch, training_inj_loss, alpha=0.75,
+              linestyle='--', label='Training Inj Loss')
+ax[0, 0].plot(training_batch, training_trig_loss, alpha=0.75,
+              linestyle='--', label='Training Trig Loss')
+
+ax[1, 0].plot(validation_batch, validation_loss, alpha=0.75, label='Validation Loss')
+ax[1, 0].plot(validation_batch, validation_inj_loss, alpha=0.75,
+              linestyle='--', label='Validation Inj Loss')
+ax[1, 0].plot(validation_batch, validation_trig_loss, alpha=0.75,
+              linestyle='--', label='Validation Trig Loss')
+
+ax[0, 0].grid()
+ax[0, 0].legend()
+ax[0, 0].set_xlabel('Batches', fontsize='large')
+ax[0, 0].set_ylabel('Loss', fontsize='large')
+
+ax[1, 0].grid()
+ax[1, 0].legend()
+ax[1, 0].set_xlabel('Batches', fontsize='large')
+ax[1, 0].set_ylabel('Loss', fontsize='large')
+
+ax[0, 1].plot(training_batch, training_snr_removed, alpha=0.75, label='Training')
+ax[1, 1].plot(validation_batch, validation_snr_removed, alpha=0.75, label='Validation')
+
+ax[0, 1].grid()
+ax[0, 1].legend()
+ax[0, 1].set_xlabel('Batches', fontsize='large')
+ax[0, 1].set_ylabel('Average Fraction SNR > 4 Removed', fontsize='large')
+
+ax[1, 1].grid()
+ax[1, 1].legend()
+ax[1, 1].set_xlabel('Batches', fontsize='large')
+ax[1, 1].set_ylabel('Average Fraction SNR > 4 Removed', fontsize='large')
+
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
      title='Loss vs. Batches',
      caption=caption,

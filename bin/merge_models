@@ -42,13 +42,22 @@ for fp in args.model_files:
         epoch = max(epoch, f.attrs['epoch'])
 
 file_data.concatenate_datasets()
-training_losses = []
-validation_losses = []
-for i in range(epoch):
-    training_losses += [file_data.datasets['training_loss_epoch_{0}'.format(i + 1)][:]]
-    validation_losses += [file_data.datasets['validation_loss_epoch_{0}'.format(i + 1)][:]]
-training_losses = np.concatenate(training_losses, axis=0)
-validation_losses = np.concatenate(validation_losses, axis=0)
+batch_groups = {
+    'training_batch': [],
+    'training_loss': [],
+    'training_inj_loss': [],
+    'training_trig_loss': [],
+    'training_snr_removed': [],
+    'validation_batch': [],
+    'validation_loss': [],
+    'validation_inj_loss': [],
+    'validation_trig_loss': [],
+    'validation_snr_removed': []
+}
+for bg in batch_groups.keys():
+    for i in range(epoch):
+        batch_groups[bg] += [file_data.datasets[bg + '_epoch_{0}'.format(i + 1)][:]]
+    batch_groups[bg] = np.concatenate(batch_groups[bg], axis=0)
 
 with h5py.File(args.output_file, 'w') as f:
     
@@ -66,7 +75,7 @@ with h5py.File(args.output_file, 'w') as f:
     for k, v in file_data.datasets.items():
         _ = f.create_dataset(k, data=v)
 
-    _ = f.create_dataset('training_loss', data=training_losses)
-    _ = f.create_dataset('validation_loss', data=validation_losses)
+    for bg in batch_groups.keys():
+        _ = f.create_dataset(bg, data=batch_groups[bg])
 
 logging.info("Done!")

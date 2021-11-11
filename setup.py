@@ -34,7 +34,8 @@ setuptools.setup(
              "bin/page_sample_table",
              "bin/plot_loss",
              "bin/plot_model",
-             "bin/plot_per_batch"],
+             "bin/plot_per_batch",
+             "bin/plot_timeseries"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
