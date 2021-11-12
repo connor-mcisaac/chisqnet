@@ -1124,15 +1124,15 @@ class Convolution1DTransform(BaseTransform):
         self.kernel_max_df = tf.constant(-1. * self.kernel_freqs[0], dtype=tf.float32)
 
         kernels_real = tf.random.truncated_normal((nkernel, self.kernel_half_width * 2 + 1),
-                                                  dtype=tf.float32, seed=42)
+                                                  dtype=tf.float32)
         kernels_imag = tf.random.truncated_normal((nkernel, self.kernel_half_width * 2 + 1),
-                                                  dtype=tf.float32, seed=42)
+                                                  dtype=tf.float32)
         kernels = tf.complex(kernels_real, kernels_imag)
         self.kernels = tf.Variable(self.normalise(kernels),
                                    dtype=tf.complex64, trainable=True,
                                    constraint=self.normalise)
 
-        dts = tf.random.truncated_normal((nkernel,), dtype=tf.float32, seed=42)
+        dts = tf.random.truncated_normal((nkernel,), dtype=tf.float32)
         self.dt_weights = tf.Variable(dts, dtype=tf.float32, trainable=True)
 
         self.trainable_weights = {'kernels': self.kernels,
