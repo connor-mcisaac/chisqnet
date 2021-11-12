@@ -614,9 +614,6 @@ class ShiftTransform(BaseTransform):
         shifter = tf.complex(tf.math.cos(- 2. * np.pi * freqs * dt),
                              tf.math.sin(- 2. * np.pi * freqs * dt))
 
-        if tf.rank(temp) == 2:
-            temp = tf.expand_dims(temp, 1)
-
         return temp * shifter
 
     @tf.custom_gradient
@@ -625,10 +622,6 @@ class ShiftTransform(BaseTransform):
         dj = -1. * tf.math.floordiv(df, self.delta_f)
         dj = tf.cast(dj, tf.int32)
         dj = tf.expand_dims(dj, axis=2)
-
-        if tf.rank(temp) == 2:
-            temp = tf.expand_dims(temp, 1)
-            temp = tf.repeat(temp, tf.shape(dj)[1], axis=1)
 
         temp_idxs = tf.range(tf.shape(temp)[1], dtype=tf.int32)
         temp_idxs = tf.expand_dims(temp_idxs, axis=0)
@@ -682,6 +675,9 @@ class ShiftTransform(BaseTransform):
 
     def transform(self, temp, sample, training=False):
         dt, df = self.get_dt_df(sample, training=training)
+        if tf.rank(temp) == 2:
+            temp = tf.expand_dims(temp, 1)
+            temp = tf.repeat(temp, tf.shape(df)[1], axis=1)
         temp = self.shift_df(temp, df)
         temp = self.shift_dt(temp, dt)
         return temp
@@ -1081,7 +1077,8 @@ class Convolution1DTransform(BaseTransform):
     transformation_type = "convolution"
 
     def normalise(self, x):
-        denom = real_to_complex(tf.math.reduce_mean(tf.math.abs(x), axis=0) + 1e-7)
+        norm = tf.math.reduce_mean(tf.math.abs(x), axis=1, keepdims=True)
+        denom = real_to_complex(norm) + 1e-7
         return x / denom
 
     def clip(self, x):
@@ -1112,30 +1109,30 @@ class Convolution1DTransform(BaseTransform):
         interp_idx = np.maximum(0, np.sum(diff_f >= 0, axis=1) - 1)
         interp_frac = frac[np.arange(len(conv_freqs)), interp_idx]
 
-        interp_idx = np.repeat(interp_idx[np.newaxis, :, np.newaxis, np.newaxis], nkernel, axis=3)
+        interp_idx = np.repeat(interp_idx[np.newaxis, :], nkernel, axis=0)
         kernel_idx = np.repeat(
-            np.arange(nkernel)[np.newaxis, np.newaxis, np.newaxis, :],
+            np.arange(nkernel)[:, np.newaxis],
             self.conv_half_width * 2 + 1, axis=1
         )
-        interp_gather = np.stack([interp_idx, kernel_idx], axis=-1)
+        interp_gather = np.stack([kernel_idx, interp_idx], axis=-1)
 
-        interp_frac = np.repeat(interp_frac[np.newaxis, :, np.newaxis, np.newaxis], nkernel, axis=3)
+        interp_frac = np.repeat(interp_frac[np.newaxis, :], nkernel, axis=0)
 
         self.interp_gather = tf.convert_to_tensor(interp_gather, dtype=tf.int64)
         self.interp_frac = tf.convert_to_tensor(interp_frac, dtype=tf.complex64)
 
         self.kernel_max_df = tf.constant(-1. * self.kernel_freqs[0], dtype=tf.float32)
 
-        kernels_real = tf.random.truncated_normal((self.kernel_half_width * 2 + 1, nkernel),
-                                                  dtype=tf.float32)
-        kernels_imag = tf.random.truncated_normal((self.kernel_half_width * 2 + 1, nkernel),
-                                                  dtype=tf.float32)
+        kernels_real = tf.random.truncated_normal((nkernel, self.kernel_half_width * 2 + 1),
+                                                  dtype=tf.float32, seed=42)
+        kernels_imag = tf.random.truncated_normal((nkernel, self.kernel_half_width * 2 + 1),
+                                                  dtype=tf.float32, seed=42)
         kernels = tf.complex(kernels_real, kernels_imag)
         self.kernels = tf.Variable(self.normalise(kernels),
                                    dtype=tf.complex64, trainable=True,
                                    constraint=self.normalise)
 
-        dts = tf.random.truncated_normal((nkernel,), dtype=tf.float32)
+        dts = tf.random.truncated_normal((nkernel,), dtype=tf.float32, seed=42)
         self.dt_weights = tf.Variable(dts, dtype=tf.float32, trainable=True)
 
         self.trainable_weights = {'kernels': self.kernels,
@@ -1153,42 +1150,71 @@ class Convolution1DTransform(BaseTransform):
 
         shifter = tf.complex(tf.math.cos(- 2. * np.pi * freqs * dt),
                              tf.math.sin(- 2. * np.pi * freqs * dt))
-
-        if tf.rank(temp) == 2:
-            temp = tf.expand_dims(temp, 1)
         
         return temp * shifter
 
     @tf.function
     def convolve(self, temp, training=False):
 
-        temp = tf.expand_dims(temp, 1)
-
         kernels = self.kernels
 
-        diff = tf.concat([kernels[1:, :] - kernels[:-1, :],
-                          tf.zeros([1, self.nkernel], dtype=tf.complex64)], 0)
+        diff = tf.concat([kernels[:, 1:] - kernels[:, :-1],
+                          tf.zeros([self.nkernel, 1], dtype=tf.complex64)],
+                         axis=1)
 
         kernels = (
             tf.gather_nd(kernels, self.interp_gather)
             + self.interp_frac * tf.gather_nd(diff, self.interp_gather)
         )
-        kernels_real = tf.math.real(kernels)
-        kernels_imag = tf.math.imag(kernels)
+        kernels = tf.transpose(kernels, perm=[1, 0])
+        kernels = tf.expand_dims(kernels, axis=0)
+        kernels = tf.expand_dims(kernels, axis=2)
 
         temp = tf.transpose(temp, perm=[0, 2, 1])
         temp = tf.expand_dims(temp, axis=1)
-        temp_real = tf.math.real(temp)
-        temp_imag = tf.math.imag(temp)
 
-        padding = [[0, 0], [0, 0], [self.conv_half_width, self.conv_half_width], [0, 0]]
+        @tf.custom_gradient
+        def _convolve(temp, kernels):
+            kernels_real = tf.math.real(kernels)
+            kernels_imag = tf.math.imag(kernels)
 
-        ctemp_real = tf.nn.conv2d(temp_real, kernels_real, 1, padding, data_format='NHWC')
-        ctemp_real -= tf.nn.conv2d(temp_imag, kernels_imag, 1, padding, data_format='NHWC')
-        ctemp_imag = tf.nn.conv2d(temp_imag, kernels_real, 1, padding, data_format='NHWC')
-        ctemp_imag += tf.nn.conv2d(temp_real, kernels_imag, 1, padding, data_format='NHWC')
+            temp_real = tf.math.real(temp)
+            temp_imag = tf.math.imag(temp)
 
-        ctemp = tf.complex(ctemp_real, ctemp_imag)
+            padding = [[0, 0], [0, 0], [self.conv_half_width, self.conv_half_width], [0, 0]]
+
+            ctemp_real = tf.nn.conv2d(temp_real, kernels_real, 1, padding, data_format='NHWC')
+            ctemp_real -= tf.nn.conv2d(temp_imag, kernels_imag, 1, padding, data_format='NHWC')
+            ctemp_imag = tf.nn.conv2d(temp_imag, kernels_real, 1, padding, data_format='NHWC')
+            ctemp_imag += tf.nn.conv2d(temp_real, kernels_imag, 1, padding, data_format='NHWC')
+
+            ctemp = tf.complex(ctemp_real, ctemp_imag)
+
+            def grad(upstream):
+                # upstream [batch, 1, width, nkernel]
+                # change to [batch, width, 1, nkernel]
+                upstream = tf.transpose(upstream, perm=[0, 2, 1, 3])
+                up_real = tf.math.real(upstream)
+                up_imag = tf.math.imag(upstream)
+
+                # temp [batch, 1, width, 1]
+                # change to [1, batch, width, 1]
+                temp_k = tf.transpose(temp, perm=[1, 0, 2, 3])
+                k_real = tf.math.real(temp_k)
+                k_imag = tf.math.imag(temp_k)
+
+                grad_real = tf.nn.conv2d(k_real, up_real, 1, padding, data_format='NHWC')
+                grad_real += tf.nn.conv2d(k_imag, up_imag, 1, padding, data_format='NHWC')
+                grad_imag = - tf.nn.conv2d(k_imag, up_real, 1, padding, data_format='NHWC')
+                grad_imag += tf.nn.conv2d(k_real, up_imag, 1, padding, data_format='NHWC')
+
+                grad_comp = tf.complex(grad_real, grad_imag)
+                grad_comp = tf.transpose(grad_comp, perm=[0, 2, 1, 3])
+                return None, grad_comp
+
+            return ctemp, grad
+
+        ctemp = _convolve(temp, kernels)
         ctemp = ctemp[:, 0, :, :]
         ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
 
@@ -1197,6 +1223,8 @@ class Convolution1DTransform(BaseTransform):
         return ctemp
 
     def transform(self, temp, sample, training=False):
+        if tf.rank(temp) == 2:
+            temp = tf.expand_dims(temp, 1)
         temp = self.convolve(temp, training=training)
         temp = self.shift_dt(temp)
         return temp
@@ -1282,11 +1310,11 @@ class Convolution1DTransform(BaseTransform):
         dt = tf.math.tanh(self.dt_weights) * self.max_dt
 
         for i in range(self.nkernel):
-            ax[i].plot(self.kernel_freqs, kernels_real.numpy()[:, i], label='real', alpha=0.75)
-            ax[i].plot(self.kernel_freqs, kernels_imag.numpy()[:, i], label='imag', alpha=0.75)
+            ax[i].plot(self.kernel_freqs, kernels_real.numpy()[i, :], label='real', alpha=0.75)
+            ax[i].plot(self.kernel_freqs, kernels_imag.numpy()[i, :], label='imag', alpha=0.75)
             
-            max_amp = max(np.max(np.abs(kernels_real.numpy()[:, i])),
-                          np.max(np.abs(kernels_imag.numpy()[:, i])))
+            max_amp = max(np.max(np.abs(kernels_real.numpy()[i, :])),
+                          np.max(np.abs(kernels_imag.numpy()[i, :])))
             ax[i].set_ylim([-max_amp, max_amp])
 
             ax[i].legend()
