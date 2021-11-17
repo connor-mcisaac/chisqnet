@@ -436,23 +436,45 @@ class TemplateMixer(object):
 
 class ChisqFilter(MatchedFilter):
 
-    def clip(self, x):
-        return tf.clip_by_value(x, 1., self.threshold_max)
-
-    def __init__(self, freqs, f_low, f_high, transform, mixer=None, threshold_max=2.):
+    def __init__(self, freqs, f_low, f_high, transform, mixer=None,
+                 threshold_max=4., power_max=6., constant_max=2.,
+                 train_threshold=False, train_power=False,
+                 train_constant=False):
         super().__init__(freqs, f_low, f_high)
         self.transform = transform
         self.mixer = mixer
         self.threshold_max = threshold_max
-        self.threshold = tf.Variable(np.array([1.], dtype=np.float32), trainable=True,
-                                     dtype=tf.float32, constraint=self.clip)
+        self.train_threshold = train_threshold
+        thresh_const = lambda x: tf.clip_by_value(x, 1., self.threshold_max)
+        self.threshold = tf.Variable(np.array([1.], dtype=np.float32),
+                                     trainable=train_threshold,
+                                     dtype=tf.float32, constraint=thresh_const)
+
+        self.power_max = power_max
+        self.train_power = train_power
+        power_const = lambda x: tf.clip_by_value(x, 1., self.power_max)
+        self.power = tf.Variable(np.array([2.], dtype=np.float32),
+                                 trainable=train_power,
+                                 dtype=tf.float32, constraint=power_const)
+
+        self.constant_max = constant_max
+        self.train_constant = train_constant
+        constant_const = lambda x: tf.clip_by_value(x, 0., self.constant_max)
+        self.constant = tf.Variable(np.array([0.], dtype=np.float32),
+                                    trainable=train_constant,
+                                    dtype=tf.float32, constraint=constant_const)
         self.trainable_weights = {}
         for k, v in self.transform.trainable_weights.items():
             self.trainable_weights[k] = v
         if self.mixer:
             for k, v in self.mixer.trainable_weights.items():
                 self.trainable_weights[k] = v
-        self.trainable_weights['threshold'] = self.threshold
+        if train_threshold:
+            self.trainable_weights['threshold'] = self.threshold
+        if train_power:
+            self.trainable_weights['power'] = self.power
+        if train_constant:
+            self.trainable_weights['constant'] = self.constant
 
     def get_max_idx(self, data, gather_idxs=None):
         if gather_idxs is not None:
@@ -510,17 +532,17 @@ class ChisqFilter(MatchedFilter):
 
         rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
 
-        chisq_thresh = rchisq / self.threshold
-        chisq_thresh = tf.math.maximum(chisq_thresh, tf.ones_like(chisq_thresh))
+        chisq_mod = ((rchisq / self.threshold) + self.constant) / (1. + self.constant)
+        chisq_mod = tf.math.maximum(chisq_mod, tf.ones_like(chisq_mod))
 
-        snr_prime = snr / chisq_thresh ** 0.5
+        snr_prime = snr / chisq_mod ** (1. / self.power)
 
         if not max_snr:
             snr_prime, max_idx = self.get_max_idx(snr_prime)
             gather_max = tf.stack([tf.range(tf.shape(max_idx)[0], dtype=tf.int64), max_idx], axis=-1)
-            chisq_thresh = tf.gather_nd(chisq_thresh, gather_max)
+            snr = tf.gather_nd(snr, gather_max)
         logging.info("SNR' calculated")
-        return snr_prime, chisq_thresh
+        return snr_prime, snr
 
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high):
@@ -539,8 +561,20 @@ class ChisqFilter(MatchedFilter):
             mixer = None
 
         threshold_max = config.getfloat("model", "threshold-max")
+        power_max = config.getfloat("model", "power-max")
+        constant_max = config.getfloat("model", "constant-max")
+
+        train_threshold = config.getboolean("model", "train-threshold", fallback=False)
+        train_power = config.getboolean("model", "train-power", fallback=False)
+        train_constant = config.getboolean("model", "train-constant", fallback=False)
+
         obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
-                  threshold_max=threshold_max)
+                  threshold_max=threshold_max,
+                  power_max=power_max,
+                  constant_max=constant_max,
+                  train_threshold=train_threshold,
+                  train_power=train_power,
+                  train_constant=train_constant)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -556,6 +590,13 @@ class ChisqFilter(MatchedFilter):
                 g = f
             _ = g.create_dataset("threshold_max", data=np.array([self.threshold_max]))
             _ = g.create_dataset("threshold", data=self.threshold.numpy())
+            _ = g.create_dataset("train_threshold", data=np.array([int(self.train_threshold)]))
+            _ = g.create_dataset("power_max", data=np.array([self.power_max]))
+            _ = g.create_dataset("power", data=self.power.numpy())
+            _ = g.create_dataset("train_power", data=np.array([int(self.train_power)]))
+            _ = g.create_dataset("constant_max", data=np.array([self.constant_max]))
+            _ = g.create_dataset("constant", data=self.constant.numpy())
+            _ = g.create_dataset("train_constant", data=np.array([int(self.train_constant)]))
 
         if group is None:
             group = ''
@@ -572,6 +613,13 @@ class ChisqFilter(MatchedFilter):
                 g = f
             threshold_max = g["threshold_max"][0]
             threshold = g["threshold"][0]
+            train_threshold = bool(g['train_threshold'][0])
+            power_max = g["power_max"][0]
+            power = g["power"][0]
+            train_power = bool(g['train_power'][0])
+            constant_max = g["constant_max"][0]
+            constant = g["constant"][0]
+            train_constant = bool(g['train_constant'][0])
             if 'mixer' in g.keys():
                 mixer_check = True
             else:
@@ -585,11 +633,34 @@ class ChisqFilter(MatchedFilter):
             mixer = None
 
         obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
-                  threshold_max=threshold_max)
+                  threshold_max=threshold_max,
+                  power_max=power_max,
+                  constant_max=constant_max,
+                  train_threshold=train_threshold,
+                  train_power=train_power,
+                  train_constant=train_constant)
 
-        obj.threshold = tf.Variable(np.array([threshold], dtype=np.float32), trainable=True,
-                                    dtype=tf.float32, constraint=obj.clip)
-        obj.trainable_weights['threshold'] = obj.threshold
+        thresh_const = lambda x: tf.clip_by_value(x, 1., obj.threshold_max)
+        obj.threshold = tf.Variable(np.array([threshold], dtype=np.float32),
+                                    trainable=train_threshold,
+                                    dtype=tf.float32, constraint=thresh_const)
+
+        power_const = lambda x: tf.clip_by_value(x, 1., obj.power_max)
+        obj.power = tf.Variable(np.array([power], dtype=np.float32),
+                                trainable=train_power,
+                                dtype=tf.float32, constraint=power_const)
+
+        constant_const = lambda x: tf.clip_by_value(x, 0., obj.constant_max)
+        obj.constant = tf.Variable(np.array([constant], dtype=np.float32),
+                                   trainable=train_constant,
+                                   dtype=tf.float32, constraint=constant_const)
+
+        if train_threshold:
+            obj.trainable_weights['threshold'] = obj.threshold
+        if train_power:
+            obj.trainable_weights['power'] = obj.power
+        if train_constant:
+            obj.trainable_weights['constant'] = obj.constant
 
         return obj
 
