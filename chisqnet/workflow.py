@@ -278,7 +278,7 @@ class PrepareSamplesExecutable(Executable):
 
 class TrainingExecutable(Executable):
     
-    current_retention_level = Executable.ALL_TRIGGERS
+    current_retention_level = Executable.MERGED_TRIGGERS
     def create_node(self, epochs, training_samples, validation_samples,
                     bank, config, checkpoint=None):
         node = Node(self)
