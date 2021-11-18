@@ -192,6 +192,7 @@ for i in range(args.epochs):
     trig_epoch = 0
 
     snr_removed = []
+    inj_removed = []
 
     times = 0.
 
@@ -202,6 +203,7 @@ for i in range(args.epochs):
     val_trig_losses = []
 
     val_snr_removeds = []
+    val_inj_removeds = []
 
     for j in range(nbatches):
 
@@ -225,7 +227,7 @@ for i in range(args.epochs):
 
         with tf.GradientTape() as tape:
 
-            snr_prime, snr = chisq_transform.get_max_snr_prime(
+            snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
                 temp, segs, psds, params,
                 gather_idxs=gather_idxs,
                 max_snr=True, training=True
@@ -260,8 +262,9 @@ for i in range(args.epochs):
         trig_losses += [np.sum(batch_loss.numpy()[trig_lgc])]
 
         snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-        snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4.)
+        snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4. + 1e-7)
         snr_removed += [np.sum(1 - ((snr_prime_thresh - 4.) / (snr_thresh - 4.)).numpy()[trig_lgc])]
+        inj_removed += [np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])]
 
         times += time.time() - start
 
@@ -298,8 +301,16 @@ for i in range(args.epochs):
         val_trig_loss = 0.
 
         val_snr_removed = 0.
+        val_inj_removed = 0.
 
         val_times = 0.
+
+        val_trig_snr_primes = []
+        val_trig_snrs = []
+        val_trig_rchisq = []
+        val_inj_snr_primes = []
+        val_inj_snrs = []
+        val_inj_rchisq = []
 
         for k in range(val_nbatches):
 
@@ -318,7 +329,7 @@ for i in range(args.epochs):
 
             logging.info("Batch inputs read")
 
-            snr_prime, snr = chisq_transform.get_max_snr_prime(
+            snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
                 temp, segs, psds, params,
                 gather_idxs=gather_idxs,
                 max_snr=True, training=False
@@ -341,8 +352,18 @@ for i in range(args.epochs):
             val_trig_loss += np.sum(batch_loss.numpy()[trig_lgc])
 
             snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-            snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4.)
+            snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4. + 1e-7)
             val_snr_removed += np.sum(1 - ((snr_prime_thresh - 4.) / (snr_thresh - 4.)).numpy()[trig_lgc])
+            val_inj_removed += np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])
+
+            if np.sum(trig_lgc):
+                val_trig_snr_primes += [snr_prime.numpy()[trig_lgc]]
+                val_trig_snrs += [snr.numpy()[trig_lgc]]
+                val_trig_rchisq += [rchisq.numpy()[trig_lgc]]
+            if np.sum(inj_lgc):
+                val_inj_snr_primes += [snr_prime.numpy()[inj_lgc]]
+                val_inj_snrs += [snr.numpy()[inj_lgc]]
+                val_inj_rchisq += [rchisq.numpy()[inj_lgc]]
 
             val_times += time.time() - start
 
@@ -366,6 +387,7 @@ for i in range(args.epochs):
         val_trig_losses += [val_trig_loss / val_trig_count]
 
         val_snr_removeds += [val_snr_removed / val_trig_count]
+        val_inj_removeds += [val_snr_removed / val_inj_count]
 
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
         chisq_transform.to_file(
@@ -388,21 +410,50 @@ for i in range(args.epochs):
     inj_losses = np.array(inj_losses) / np.maximum(np.array(inj_count), 1)
     trig_losses = np.array(trig_losses) / np.maximum(np.array(trig_count), 1)
     snr_removed = np.array(snr_removed) / np.maximum(np.array(trig_count), 1)
+    inj_removed = np.array(inj_removed) / np.maximum(np.array(inj_count), 1)
+
+    if len(val_trig_snr_primes):
+        val_trig_snr_primes = np.concatenate(val_trig_snr_primes, axis=0)
+        val_trig_snrs = np.concatenate(val_trig_snrs, axis=0)
+        val_trig_rchisq = np.concatenate(val_trig_rchisq, axis=0)
+    if len(val_inj_snr_primes):
+        val_inj_snr_primes = np.concatenate(val_inj_snr_primes, axis=0)
+        val_inj_snrs = np.concatenate(val_inj_snrs, axis=0)
+        val_inj_rchisq = np.concatenate(val_inj_rchisq, axis=0)
 
     with h5py.File(args.output_file, 'a') as f:
         _ = f.create_dataset('training_batch_epoch_{0}'.format(epoch + i + 1), data=np.array(batches))
         _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
         _ = f.create_dataset('training_inj_loss_epoch_{0}'.format(epoch + i + 1), data=inj_losses)
         _ = f.create_dataset('training_trig_loss_epoch_{0}'.format(epoch + i + 1), data=trig_losses)
-        _ = f.create_dataset('training_snr_removed_epoch_{0}'.format(epoch + i + 1), data=snr_removed)
+        _ = f.create_dataset('training_trig_snr_removed_epoch_{0}'.format(epoch + i + 1), data=snr_removed)
+        _ = f.create_dataset('training_inj_snr_removed_epoch_{0}'.format(epoch + i + 1), data=inj_removed)
 
-        _ = f.create_dataset('validation_batch_epoch_{0}'.format(epoch + i + 1),
-                             data=np.array(val_batches))
-        _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1),
-                             data=np.array(val_losses))
-        _ = f.create_dataset('validation_inj_loss_epoch_{0}'.format(epoch + i + 1),
-                             data=np.array(val_inj_losses))
-        _ = f.create_dataset('validation_trig_loss_epoch_{0}'.format(epoch + i + 1),
-                             data=np.array(val_trig_losses))
-        _ = f.create_dataset('validation_snr_removed_epoch_{0}'.format(epoch + i + 1),
-                             data=np.array(val_snr_removeds))
+        if args.validation_sample_file:
+            _ = f.create_dataset('validation_batch_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_batches))
+            _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_losses))
+            _ = f.create_dataset('validation_inj_loss_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_inj_losses))
+            _ = f.create_dataset('validation_trig_loss_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_trig_losses))
+            _ = f.create_dataset('validation_trig_snr_removed_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_snr_removeds))
+            _ = f.create_dataset('validation_inj_snr_removed_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_inj_removeds))
+
+        if len(val_trig_snr_primes):
+            _ = f.create_dataset('validation_trig_snr_primes_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_trig_snr_primes))
+            _ = f.create_dataset('validation_trig_snrs_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_trig_snrs))
+            _ = f.create_dataset('validation_trig_rchisq_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_trig_rchisq))
+        if len(val_inj_snr_primes):
+            _ = f.create_dataset('validation_inj_snr_primes_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_inj_snr_primes))
+            _ = f.create_dataset('validation_inj_snrs_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_inj_snrs))
+            _ = f.create_dataset('validation_inj_rchisq_epoch_{0}'.format(epoch + i + 1),
+                                 data=np.array(val_inj_rchisq))

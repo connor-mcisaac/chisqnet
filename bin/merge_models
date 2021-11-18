@@ -47,12 +47,14 @@ batch_groups = {
     'training_loss': [],
     'training_inj_loss': [],
     'training_trig_loss': [],
-    'training_snr_removed': [],
+    'training_trig_snr_removed': [],
+    'training_inj_snr_removed': [],
     'validation_batch': [],
     'validation_loss': [],
     'validation_inj_loss': [],
     'validation_trig_loss': [],
-    'validation_snr_removed': []
+    'validation_trig_snr_removed': [],
+    'validation_inj_snr_removed': []
 }
 for bg in batch_groups.keys():
     for i in range(epoch):

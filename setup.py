@@ -33,6 +33,8 @@ setuptools.setup(
              "bin/merge_models",
              "bin/page_sample_table",
              "bin/plot_loss",
+             "bin/plot_transform",
+             "bin/plot_mixer",
              "bin/plot_model",
              "bin/plot_per_batch",
              "bin/plot_timeseries"],

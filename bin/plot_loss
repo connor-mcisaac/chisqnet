@@ -23,18 +23,20 @@ with h5py.File(args.input_file, 'r') as f:
      training_loss = f['training_loss'][:]
      training_inj_loss = f['training_inj_loss'][:]
      training_trig_loss = f['training_trig_loss'][:]
-     training_snr_removed = f['training_snr_removed'][:]
+     training_snr_removed = f['training_trig_snr_removed'][:]
+     training_inj_removed = f['training_inj_snr_removed'][:]
 
      validation_batch = f['validation_batch'][:]
      validation_loss = f['validation_loss'][:]
      validation_inj_loss = f['validation_inj_loss'][:]
      validation_trig_loss = f['validation_trig_loss'][:]
-     validation_snr_removed = f['validation_snr_removed'][:]
+     validation_snr_removed = f['validation_trig_snr_removed'][:]
+     validation_inj_removed = f['validation_inj_snr_removed'][:]
 
 caption = "This is a plot of the loss as it evolves with " \
 	  "the number of batches of training."
 
-fig, ax = plt.subplots(ncols=2, nrows=2, figsize=(18, 12))
+fig, ax = plt.subplots(ncols=3, nrows=2, figsize=(32, 12))
 
 ax[0, 0].plot(training_batch, training_loss, alpha=0.75, label='Training Loss')
 ax[0, 0].plot(training_batch, training_inj_loss, alpha=0.75,
@@ -70,6 +72,19 @@ ax[1, 1].grid()
 ax[1, 1].legend()
 ax[1, 1].set_xlabel('Batches', fontsize='large')
 ax[1, 1].set_ylabel('Average Fraction SNR > 4 Removed', fontsize='large')
+
+ax[0, 2].plot(training_batch, training_inj_removed, alpha=0.75, label='Training')
+ax[1, 2].plot(validation_batch, validation_inj_removed, alpha=0.75, label='Validation')
+
+ax[0, 2].grid()
+ax[0, 2].legend()
+ax[0, 2].set_xlabel('Batches', fontsize='large')
+ax[0, 2].set_ylabel('Average Fraction Injection SNR Removed', fontsize='large')
+
+ax[1, 2].grid()
+ax[1, 2].legend()
+ax[1, 2].set_xlabel('Batches', fontsize='large')
+ax[1, 2].set_ylabel('Average Fraction Injection SNR Removed', fontsize='large')
 
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
      title='Loss vs. Batches',

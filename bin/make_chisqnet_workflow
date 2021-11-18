@@ -320,14 +320,35 @@ node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
 workflow.add_node(node)
 layout.two_column_layout(rdir['training'], [(node.output_files[0],)])
 
-shift_job = PlotExecutable(workflow.cp, 'plot-model', out_dir=rdir['trained_model'],
-                           ifos=workflow.ifos, tags=[])
-node = shift_job.create_node()
+model_plots = wf.FileList([])
+
+transform_job = PlotExecutable(workflow.cp, 'plot-transform', out_dir=rdir['trained_model'],
+                               ifos=workflow.ifos, tags=[])
+node = transform_job.create_node()
 node.add_input_opt('--model-file', trained_model)
 node.add_input_opt('--bank-file', bank_file)
 node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
 workflow.add_node(node)
-layout.two_column_layout(rdir['trained_model'], [(node.output_files[0],)])
+model_plots.append(node.output_files[0])
+
+mixer_job = PlotExecutable(workflow.cp, 'plot-mixer', out_dir=rdir['trained_model'],
+                           ifos=workflow.ifos, tags=[])
+node = mixer_job.create_node()
+node.add_input_opt('--model-file', trained_model)
+node.add_input_opt('--bank-file', bank_file)
+node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+workflow.add_node(node)
+model_plots.append(node.output_files[0])
+
+model_job = PlotExecutable(workflow.cp, 'plot-model', out_dir=rdir['trained_model'],
+                           ifos=workflow.ifos, tags=[])
+node = model_job.create_node()
+node.add_input_opt('--model-file', trained_model)
+node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+workflow.add_node(node)
+model_plots.append(node.output_files[0])
+
+layout.single_layout(rdir['trained_model'], model_plots)
 
 # Create results pages
 logging.info("Setting up results pages")
@@ -338,9 +359,10 @@ wf.makedir(base)
 ini_file_path = os.path.join(base, 'configuration.ini')
 with open(ini_file_path, 'w') as ini_fh:
     container.cp.write(ini_fh)
-ini_file = wf.FileList([wf.File(workflow.ifos, '', trained_model.segment,
-                        file_url='file://' + ini_file_path)])
-layout.single_layout(base, ini_file)
+ini_files = wf.FileList([training_config_file])
+ini_files.append(wf.File(workflow.ifos, '', trained_model.segment,
+                         file_url='file://' + ini_file_path))
+layout.single_layout(base, ini_files)
 
 log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', trained_model.segment,
                         extension='.html', directory=rdir['workflow'])

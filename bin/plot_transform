@@ -15,6 +15,8 @@ parser = argparse.ArgumentParser()
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-file", required=True,
                     help="File containing model to be plotted")
+parser.add_argument("--bank-file", required=True,
+                    help="File containing bank to be plotted")
 
 parser.add_argument("--output-file", required=True,
                     help="Location of the output file")
@@ -23,10 +25,6 @@ args = parser.parse_args()
 
 with h5py.File(args.model_file, 'r') as f:
      epoch = f.attrs['epoch']
-     trig_snr = f['validation_trig_snrs_epoch_{0}'.format(epoch)][:]
-     trig_rchisq = f['validation_trig_rchisq_epoch_{0}'.format(epoch)][:]
-     inj_snr = f['validation_inj_snrs_epoch_{0}'.format(epoch)][:]
-     inj_rchisq = f['validation_inj_rchisq_epoch_{0}'.format(epoch)][:]
 
 chisq_transform = ChisqFilter.from_file(
      args.model_file,
@@ -34,14 +32,12 @@ chisq_transform = ChisqFilter.from_file(
      group="model_epoch_{0}".format(epoch)
 )
 
-fig, ax = chisq_transform.plot_model(
-     trig_snr, trig_rchisq,
-     inj_snr, inj_rchisq
-)
+bank = waveform.TemplateBank(args.bank_file)
+fig, ax = chisq_transform.transform.plot_model(bank)
 
-caption = "This is a plot of the trained re-weighting after all training is complete."
+caption = "This is a plot of the trained transform after all training is complete."
 
 pycbc.results.save_fig_with_metadata(fig, args.output_file,
-     title='Re-weighting',
+     title='Transform',
      caption=caption,
      cmd=' '.join(sys.argv))

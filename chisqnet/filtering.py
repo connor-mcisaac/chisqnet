@@ -541,8 +541,9 @@ class ChisqFilter(MatchedFilter):
             snr_prime, max_idx = self.get_max_idx(snr_prime)
             gather_max = tf.stack([tf.range(tf.shape(max_idx)[0], dtype=tf.int64), max_idx], axis=-1)
             snr = tf.gather_nd(snr, gather_max)
+            rchisq = tf.gather_nd(rchisq, gather_max)
         logging.info("SNR' calculated")
-        return snr_prime, snr
+        return snr_prime, snr, rchisq
 
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high):
@@ -669,6 +670,45 @@ class ChisqFilter(MatchedFilter):
         if self.mixer:
             loss += self.mixer.get_regulariser_loss()
         return loss
+
+    def plot_model(self, trig_snrs, trig_rchisq, inj_snrs, inj_rchisq, title=None):
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        chi_cont = np.logspace(-2, 4, 300)
+        for c in [5, 7, 9, 11, 13]:
+            chisq_mod = ((chi_cont / self.threshold.numpy() + self.constant.numpy())
+                         / (1. + self.constant.numpy()))
+            chisq_mod = np.maximum(chisq_mod, np.ones_like(chisq_mod))
+
+            snr_cont = c * (chisq_mod ** (1. / self.power.numpy()))
+
+            ax.plot(snr_cont, chi_cont, color='black', alpha=0.5, linestyle='--')
+
+        ax.scatter(trig_snrs, trig_rchisq, c='black', s=5., marker='o', label='Noise', alpha=0.75)
+        ax.scatter(inj_snrs, inj_rchisq, s=20., marker='^', label='Injections', alpha=0.75)
+
+        ax.scatter([], [], label='threshold = {0:.2f}'.format(self.threshold.numpy()[0]), c='w')
+        ax.scatter([], [], label='power = 1 / {0:.2f}'.format(self.power.numpy()[0]), c='w')
+        ax.scatter([], [], label='constant = {0:.2f}'.format(self.constant.numpy()[0]), c='w')
+
+        ax.legend(loc='upper left')
+
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+
+        ax.set_xlim((min(trig_snrs.min(), inj_snrs.min()) * 0.9,
+                     max(trig_snrs.max(), inj_snrs.max()) * 1.5))
+        ax.set_ylim((min(trig_rchisq.min(), inj_rchisq.min()) * 0.9,
+                     max(trig_rchisq.max(), inj_rchisq.max()) * 1.5))
+
+        ax.set_xlabel('SNR', fontsize='large')
+        ax.set_ylabel('Reduced $\chi^2$', fontsize='large')
+        ax.grid()
+
+        if title:
+            ax.set_title(title, fontsize="large")
+
+        return fig, ax
 
 
 class ShiftTransform(BaseTransform):
