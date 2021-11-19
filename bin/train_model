@@ -316,9 +316,7 @@ for i in range(args.epochs):
 
             lidx = int(1. * k * validation_samples.num / val_nbatches)
             hidx = int(1. * (k + 1) * validation_samples.num / val_nbatches)
-
-            idxs = order[lidx:hidx]
-            idxs = np.sort(idxs)
+            idxs = np.arange(lidx, hidx)
 
             logging.info("Starting batch")
 
