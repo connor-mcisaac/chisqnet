@@ -261,9 +261,9 @@ for i in range(args.epochs):
         inj_losses += [np.sum(batch_loss.numpy()[inj_lgc])]
         trig_losses += [np.sum(batch_loss.numpy()[trig_lgc])]
 
-        snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-        snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4. + 1e-7)
-        snr_removed += [np.sum(1 - ((snr_prime_thresh - 4.) / (snr_thresh - 4.)).numpy()[trig_lgc])]
+        snr_prime_above = tf.maximum(snr_prime - 4., tf.zeros_like(snr_prime))
+        snr_above = tf.maximum(snr - 4., tf.ones_like(snr) * 1e-3)
+        snr_removed += [np.sum(1 - (snr_prime_above / snr_above).numpy()[trig_lgc])]
         inj_removed += [np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])]
 
         times += time.time() - start
@@ -351,9 +351,9 @@ for i in range(args.epochs):
             val_inj_loss += np.sum(batch_loss.numpy()[inj_lgc])
             val_trig_loss += np.sum(batch_loss.numpy()[trig_lgc])
 
-            snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-            snr_thresh = tf.maximum(snr, tf.ones_like(snr) * 4. + 1e-7)
-            val_snr_removed += np.sum(1 - ((snr_prime_thresh - 4.) / (snr_thresh - 4.)).numpy()[trig_lgc])
+            snr_prime_above = tf.maximum(snr_prime - 4., tf.zeros_like(snr_prime))
+            snr_above = tf.maximum(snr - 4., tf.ones_like(snr) * 1e-3)
+            val_snr_removed += np.sum(1 - (snr_prime_above / snr_above).numpy()[trig_lgc])
             val_inj_removed += np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])
 
             if np.sum(trig_lgc):
@@ -387,7 +387,7 @@ for i in range(args.epochs):
         val_trig_losses += [val_trig_loss / val_trig_count]
 
         val_snr_removeds += [val_snr_removed / val_trig_count]
-        val_inj_removeds += [val_snr_removed / val_inj_count]
+        val_inj_removeds += [val_inj_removed / val_inj_count]
 
     if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
         chisq_transform.to_file(

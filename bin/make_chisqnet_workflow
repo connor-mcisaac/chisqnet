@@ -356,12 +356,18 @@ create_versioning_page(rdir['workflow/version'], container.cp)
 
 base = rdir['workflow/configuration']
 wf.makedir(base)
-ini_file_path = os.path.join(base, 'configuration.ini')
-with open(ini_file_path, 'w') as ini_fh:
-    container.cp.write(ini_fh)
-ini_files = wf.FileList([training_config_file])
-ini_files.append(wf.File(workflow.ifos, '', trained_model.segment,
-                         file_url='file://' + ini_file_path))
+model_ini_file_path = os.path.join(base, 'model_configuration.ini')
+with open(training_config_file.storage_path, 'r') as ini:
+    model_ini = ini.read()
+with open(model_ini_file_path, 'w') as ini:
+    ini.write(model_ini)
+run_ini_file_path = os.path.join(base, 'run_configuration.ini')
+with open(run_ini_file_path, 'w') as ini:
+    container.cp.write(ini)
+ini_files = wf.FileList([wf.File(workflow.ifos, 'MODEL_CONFIG', trained_model.segment,
+                                 file_url='file://' + model_ini_file_path),
+                         wf.File(workflow.ifos, 'RUN_CONFIG', trained_model.segment,
+                                 file_url='file://' + run_ini_file_path)])
 layout.single_layout(base, ini_files)
 
 log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', trained_model.segment,
