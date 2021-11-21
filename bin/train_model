@@ -85,7 +85,7 @@ parser.add_argument("--loss-function", default="absolute",
 parser.add_argument("--learning-rate", default=0.001, type=float,
                     help="The learning rate passed to the training optimizer")
 parser.add_argument("--learning-rate-decay", default=1., type=float,
-                    help="The value to multiply the learning rate by after each step")
+                    help="The value to multiply the learning rate by after each epoch")
 
 # Gather arguments for transform
 parser.add_argument("--config-file", required=True,
@@ -205,10 +205,9 @@ for i in range(args.epochs):
     val_snr_removeds = []
     val_inj_removeds = []
 
-    for j in range(nbatches):
+    optimizer.learning_rate = args.learning_rate * args.learning_rate_decay ** (epoch + i)
 
-        nstep = nbatch // args.batches_per_step
-        optimizer.learning_rate = args.learning_rate * args.learning_rate_decay ** (nstep)
+    for j in range(nbatches):
 
         lidx = int(1. * j * training_samples.num / nbatches)
         hidx = int(1. * (j + 1) * training_samples.num / nbatches)
