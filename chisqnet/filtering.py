@@ -626,6 +626,8 @@ class ChisqFilter(MatchedFilter):
             else:
                 mixer_check = False
 
+        if group is None:
+            group = ''
         transform = load_transformation(file_path, freqs, f_low, f_high,
                                         group=group + '/transform')
         if mixer_check:
