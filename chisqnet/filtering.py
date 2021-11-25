@@ -203,6 +203,10 @@ class BaseTransform(BaseFilter):
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
+    def pycbc_transform(self, temp, params):
+        temp = self.transform(temp, params, training=False)
+        return temp
+
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
 
@@ -1194,8 +1198,46 @@ class Convolution1DTransform(BaseTransform):
         denom = real_to_complex(norm) + 1e-7
         return x / denom
 
-    def clip(self, x):
-        return tf.clip_by_value(x, - self.max_dt, self.max_dt)
+    def create_interpolator(self, fin, fout, temp_num=1):
+        delta = (fin[1] - fin[0])
+        interp_idx = np.clip(np.floor_divide(fout - fin[0], delta), 0., len(fout))
+        interp_frac = np.maximum(np.mod(fout - fin[0], delta) / delta, 0.)
+
+        interp_idx = np.repeat(interp_idx[np.newaxis, np.newaxis, :], temp_num, axis=1)
+        temp_idx = np.repeat(np.arange(temp_num)[np.newaxis, :, np.newaxis], len(fout), axis=2)
+        interp_gather = np.stack([temp_idx, interp_idx], axis=-1)
+
+        interp_frac = np.repeat(interp_frac[np.newaxis, np.newaxis, :], temp_num, axis=1)
+
+        interp_gather = tf.convert_to_tensor(interp_gather, dtype=tf.int64)
+        interp_frac = tf.convert_to_tensor(interp_frac, dtype=tf.complex64)
+
+        def _interpolate(temp):
+            t_shape = tf.shape(temp)
+            g_shape = tf.shape(interp_gather)
+
+            batch_idx = tf.range(t_shape[0], dtype=tf.int64)
+            batch_idx = tf.expand_dims(batch_idx, axis=1)
+            batch_idx = tf.repeat(batch_idx, g_shape[1], axis=1)
+            batch_idx = tf.expand_dims(batch_idx, axis=2)
+            batch_idx = tf.repeat(batch_idx, g_shape[2], axis=2)
+            batch_idx = tf.expand_dims(batch_idx, axis=3)
+
+            gather = tf.repeat(interp_gather, t_shape[0], axis=0)
+            gather = tf.concat([batch_idx, gather], axis=3)
+
+            diff = tf.concat([temp[:, :, 1:] - temp[:, :, :-1],
+                              tf.zeros([t_shape[0], t_shape[1], 1], dtype=tf.complex64)],
+                             axis=2)
+            interp = (
+                tf.gather_nd(temp, gather)
+                + interp_frac * tf.gather_nd(diff, gather)
+            )
+            return interp
+
+        return _interpolate
+
+        
 
     def __init__(self, nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high,
                  l1_reg=0., l2_reg=0.):
@@ -1207,34 +1249,14 @@ class Convolution1DTransform(BaseTransform):
         self.max_df = max_df
         self.max_dt = max_dt
 
-        self.conv_half_width = int(max_df // self.delta_f)
-        conv_freqs = np.arange(self.conv_half_width * 2 + 1) * self.delta_f
-        conv_freqs -= conv_freqs[self.conv_half_width + 1]
-        self.conv_freqs = tf.convert_to_tensor(conv_freqs.astype(np.float32), dtype=tf.float32)
-
         self.kernel_half_width = int(max_df // kernel_df)
         self.kernel_freqs = np.arange(self.kernel_half_width * 2 + 1) * self.kernel_df
         self.kernel_freqs -= self.kernel_freqs[self.kernel_half_width + 1]
 
-        diff_f = conv_freqs[:, np.newaxis] - self.kernel_freqs[np.newaxis, :]
-        frac = np.maximum(diff_f / self.kernel_df, 0.)
+        conv_freqs = np.arange(0., self.freqs[-1], self.kernel_df)
 
-        interp_idx = np.maximum(0, np.sum(diff_f >= 0, axis=1) - 1)
-        interp_frac = frac[np.arange(len(conv_freqs)), interp_idx]
-
-        interp_idx = np.repeat(interp_idx[np.newaxis, :], nkernel, axis=0)
-        kernel_idx = np.repeat(
-            np.arange(nkernel)[:, np.newaxis],
-            self.conv_half_width * 2 + 1, axis=1
-        )
-        interp_gather = np.stack([kernel_idx, interp_idx], axis=-1)
-
-        interp_frac = np.repeat(interp_frac[np.newaxis, :], nkernel, axis=0)
-
-        self.interp_gather = tf.convert_to_tensor(interp_gather, dtype=tf.int64)
-        self.interp_frac = tf.convert_to_tensor(interp_frac, dtype=tf.complex64)
-
-        self.kernel_max_df = tf.constant(-1. * self.kernel_freqs[0], dtype=tf.float32)
+        self.to_conv = self.create_interpolator(self.freqs.numpy(), conv_freqs)
+        self.from_conv = self.create_interpolator(conv_freqs, self.freqs.numpy(), temp_num=nkernel)
 
         kernels_real = tf.random.truncated_normal((nkernel, self.kernel_half_width * 2 + 1),
                                                   dtype=tf.float32)
@@ -1270,15 +1292,8 @@ class Convolution1DTransform(BaseTransform):
     def convolve(self, temp, training=False):
 
         kernels = self.kernels
+        temp = self.to_conv(temp)
 
-        diff = tf.concat([kernels[:, 1:] - kernels[:, :-1],
-                          tf.zeros([self.nkernel, 1], dtype=tf.complex64)],
-                         axis=1)
-
-        kernels = (
-            tf.gather_nd(kernels, self.interp_gather)
-            + self.interp_frac * tf.gather_nd(diff, self.interp_gather)
-        )
         kernels = tf.transpose(kernels, perm=[1, 0])
         kernels = tf.expand_dims(kernels, axis=0)
         kernels = tf.expand_dims(kernels, axis=2)
@@ -1294,7 +1309,7 @@ class Convolution1DTransform(BaseTransform):
             temp_real = tf.math.real(temp)
             temp_imag = tf.math.imag(temp)
 
-            padding = [[0, 0], [0, 0], [self.conv_half_width, self.conv_half_width], [0, 0]]
+            padding = [[0, 0], [0, 0], [self.kernel_half_width, self.kernel_half_width], [0, 0]]
 
             ctemp_real = tf.nn.conv2d(temp_real, kernels_real, 1, padding, data_format='NHWC')
             ctemp_real -= tf.nn.conv2d(temp_imag, kernels_imag, 1, padding, data_format='NHWC')
@@ -1331,8 +1346,10 @@ class Convolution1DTransform(BaseTransform):
         ctemp = ctemp[:, 0, :, :]
         ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
 
-        div = tf.convert_to_tensor(self.conv_half_width * 2 + 1, dtype=tf.complex64)
+        div = tf.convert_to_tensor(self.kernel_half_width * 2 + 1, dtype=tf.complex64)
         ctemp = ctemp / div
+
+        ctemp = self.from_conv(ctemp)
         return ctemp
 
     def transform(self, temp, sample, training=False):
