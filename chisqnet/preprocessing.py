@@ -289,7 +289,8 @@ class TriggerList(object):
 
 class InjectionTriggers(TriggerList):
     
-    def __init__(self, inj_find, inj_trigs, approximant=None, f_lower=None):
+    def __init__(self, inj_find, inj_trigs, approximant=None, f_lower=None,
+                 ifar_threshold=0.):
 
         self._inj_params = _inj_in_params[:] + _inj_ex_params[:]
         self._inj_dtypes = _inj_in_dtypes[:] + _inj_ex_dtypes[:]
@@ -308,11 +309,12 @@ class InjectionTriggers(TriggerList):
         records = {}
 
         with h5py.File(inj_find, 'r') as f:
-            inj_ids = f['/found_after_vetoes/injection_index'][:]
+            inj_cut = f['/found_after_vetoes/ifar_exc'][:] > ifar_threshold
+            inj_ids = f['/found_after_vetoes/injection_index'][:][inj_cut]
             ifos = f.attrs['ifos'].split(' ')
 
             for ifo in ifos:
-                trig_id = f['/found_after_vetoes/' + ifo + '/trigger_id'][:]
+                trig_id = f['/found_after_vetoes/' + ifo + '/trigger_id'][:][inj_cut]
                 lgc = trig_id != -1
                     
                 trig_ids[ifo] = trig_id[lgc]

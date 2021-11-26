@@ -47,7 +47,8 @@ parser.add_argument("--cluster-keep-top-n", type=int, default=1,
                          "removing previous triggers after each step")
 parser.add_argument("--keep-n-triggers", type=int,
                     help="After all other clustering randomly select this many triggers")
-
+parser.add_argument("--inj-ifar-cut", type=float, default=0.,
+                    help="Threshold for removing injection below IFAR")
 
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
@@ -73,7 +74,8 @@ else:
         if ifo in trigger_dict.keys():
             raise ValueError("Multiple trigger files for {0}.".format(ifo))
         trigger_dict[ifo] = fp
-    triggers = InjectionTriggers(args.injfind_file, trigger_dict)
+    triggers = InjectionTriggers(args.injfind_file, trigger_dict,
+                                 ifar_threshold=args.inj_ifar_cut)
 
 triggers.apply_segments(args.veto_files, "closed_box", within=False)
 
