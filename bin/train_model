@@ -6,14 +6,11 @@ import h5py
 import numpy as np
 from pycbc import waveform
 from pycbc.types import zeros, float32, complex64
-from chisqnet.filtering import ChisqFilter
 import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from chisqnet.training_utils import SampleFile, chi2, nc_chi2
-
 
 def abs_loss(snr_prime, snr, injs):
     snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
@@ -99,8 +96,17 @@ parser.add_argument("--checkpoint", type=int, default=1,
 
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
+parser.add_argument("--ncores", type=int, default=1)
 
 args = parser.parse_args()
+
+tf.config.threading.set_intra_op_parallelism_threads(args.ncores)
+tf.config.threading.set_inter_op_parallelism_threads(args.ncores)
+
+
+from chisqnet.filtering import ChisqFilter
+from chisqnet.training_utils import SampleFile, chi2, nc_chi2
+
 
 if args.verbose:
     log_level = logging.DEBUG
