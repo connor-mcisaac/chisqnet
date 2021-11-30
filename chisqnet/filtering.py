@@ -107,6 +107,7 @@ class MatchedFilter(BaseFilter):
             sigma = self.sigma(temp, psd)
         lgc = tf.math.not_equal(sigma, tf.zeros_like(sigma))
         mask = tf.cast(lgc, tf.complex64)
+
         sigma = tf.where(lgc, sigma, tf.ones_like(sigma))
         norm_temp = mask * temp / sigma
 
@@ -116,9 +117,9 @@ class MatchedFilter(BaseFilter):
         ow_data = self.pad(ow_data)
 
         if idx is None:
-            return self.matched_filter_ow(norm_temp, ow_data), lgc
+            return self.matched_filter_ow(norm_temp, ow_data)
         else:
-            return self.matched_filter_ow_idx(norm_temp, ow_data, idx), lgc
+            return self.matched_filter_ow_idx(norm_temp, ow_data, idx)
 
     @tf.function
     def matched_filter_ow(self, norm_temp, ow_data):
@@ -155,7 +156,7 @@ class MatchedFilter(BaseFilter):
                              tf.math.sin(2. * np.pi * idx * idxs / N))
         shifter = tf.expand_dims(shifter, axis=1)
 
-        snr = tf.math.reduce_sum(snr_tilde * shifter, axis=2)
+        snr = tf.math.reduce_sum(snr_tilde * shifter, axis=2, keepdims=True)
         return tf.math.abs(snr)
 
 
@@ -185,17 +186,17 @@ class BaseTransform(BaseFilter):
 
         inner = 4 * self.delta_f * tf.math.conj(base_norm) * temp_norm / real_to_complex(psd)
         overlap_cplx = tf.math.reduce_sum(inner, axis=2, keepdims=True)
-        overlap = tf.math.abs(overlap_cplx)
+        overlap_abs = tf.math.abs(overlap_cplx)
         
-        thresh = tf.ones_like(overlap) * thresh
-        lgc = tf.less(overlap, thresh)
+        thresh = tf.ones_like(overlap_abs) * thresh
+        lgc = tf.less(overlap_abs, thresh)
         mask = tf.cast(lgc, tf.complex64)
-        overlap = tf.where(lgc, overlap_cplx, tf.zeros_like(overlap_cplx))
+        overlap_cplx = tf.where(lgc, overlap_cplx, tf.zeros_like(overlap_cplx))
 
-        ortho = ((temp_norm - overlap * base_norm)
-                 / (1 - overlap * tf.math.conj(overlap)) ** 0.5)
+        ortho = ((temp_norm - overlap_cplx * base_norm)
+                 / (1 - overlap_cplx * tf.math.conj(overlap_cplx)) ** 0.5)
         ortho = self.pad(ortho) * mask
-        return ortho
+        return ortho, lgc
 
     def transform(self, temp, params, training=False):
 
@@ -495,7 +496,7 @@ class ChisqFilter(MatchedFilter):
         return max_data, max_data_idx
 
     def get_max_snr(self, temp, segs, psds, gather_idxs=None):
-        snr, _ = self.matched_filter(temp, segs, psds)
+        snr = self.matched_filter(temp, segs, psds)
         snr = snr[:, 0, :]
         max_snr, max_snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
         return max_snr, max_snr_idx
@@ -506,36 +507,36 @@ class ChisqFilter(MatchedFilter):
         chi_temps = self.transform.transform(temp, params, training=training)
         logging.info("Templates transformed")
 
-        chi_orthos = self.transform.get_ortho(chi_temps, temp, psds)
+        chi_orthos, ortho_lgc = self.transform.get_ortho(chi_temps, temp, psds)
         logging.info("Orthogonal templates created")
 
         if self.mixer:
             chi_orthos = self.mixer.mix_temps(chi_orthos, params, training=training)
+            chi_orthos, ortho_lgc = self.transform.get_ortho(chi_orthos, temp, psds)
 
-        snr, _ = self.matched_filter(temp, segs, psds)
+        dof = 2 * tf.shape(chi_orthos)[1]
+        dof = tf.cast(dof, tf.float32)
+
+        snr = self.matched_filter(temp, segs, psds)
         snr = snr[:, 0, :]
         snr_idx = None
         if max_snr:
-            snr, snr_idx = self.get_max_snr(temp, segs, psds, gather_idxs=gather_idxs)
+            snr, snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
         elif gather_idxs is not None:
             snr = tf.gather_nd(snr, gather_idxs)
 
-        chis, lgc = self.matched_filter(chi_orthos, segs, psds, idx=snr_idx)
-
-        mask = tf.cast(lgc, tf.float32)
-        if max_snr:
-            mask = mask[:, :, 0]
-        ortho_num = tf.reduce_sum(mask, axis=1)
-        ortho_num = tf.math.maximum(ortho_num, tf.ones_like(ortho_num))
+        chis = self.matched_filter(chi_orthos, segs, psds, idx=snr_idx)
         logging.info("SNRs calculated")
 
-        chisq = tf.math.reduce_sum(chis ** 2., axis=1)
+        chisq = tf.where(ortho_lgc, chis ** 2., tf.ones_like(chis) * 2.)
+        chisq = tf.math.reduce_sum(chisq, axis=1)
 
-        if (not max_snr) and (gather_idxs is not None):
+        if max_snr:
+            chisq = chisq[:, 0]
+        elif gather_idxs is not None:
             chisq = tf.gather_nd(chisq, gather_idxs)
 
-        rchisq = chisq / 2. / tf.stop_gradient(ortho_num)
-
+        rchisq = chisq / dof
         chisq_mod = ((rchisq / self.threshold) + self.constant) / (1. + self.constant)
         chisq_mod = tf.math.maximum(chisq_mod, tf.ones_like(chisq_mod))
 
@@ -1236,8 +1237,6 @@ class Convolution1DTransform(BaseTransform):
             return interp
 
         return _interpolate
-
-        
 
     def __init__(self, nkernel, kernel_df, max_df, max_dt, freqs, f_low, f_high,
                  l1_reg=0., l2_reg=0.):
