@@ -2,6 +2,7 @@ import logging, h5py, configparser
 import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
+from pycbc.types import FrequencySeries
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -109,7 +110,7 @@ class MatchedFilter(BaseFilter):
         mask = tf.cast(lgc, tf.complex64)
 
         sigma = tf.where(lgc, sigma, tf.ones_like(sigma))
-        norm_temp = mask * temp / sigma
+        norm_temp = mask * temp / tf.stop_gradient(sigma)
 
         ow_data = data / real_to_complex(psd)
 
@@ -181,13 +182,13 @@ class BaseTransform(BaseFilter):
         temp_sigma = self.sigma(temp, psd)
         base_sigma = self.sigma(base, psd)
 
-        temp_norm = temp / temp_sigma
-        base_norm = base / base_sigma
+        temp_norm = temp / tf.stop_gradient(temp_sigma)
+        base_norm = base / tf.stop_gradient(base_sigma)
 
         inner = 4 * self.delta_f * tf.math.conj(base_norm) * temp_norm / real_to_complex(psd)
         overlap_cplx = tf.math.reduce_sum(inner, axis=2, keepdims=True)
         overlap_abs = tf.math.abs(overlap_cplx)
-        
+
         thresh = tf.ones_like(overlap_abs) * thresh
         lgc = tf.less(overlap_abs, thresh)
         mask = tf.cast(lgc, tf.complex64)
@@ -1458,11 +1459,222 @@ class Convolution1DTransform(BaseTransform):
         return fig, ax
 
 
+class CNNTransform(BaseTransform):
+    transformation_type = "cnn"
+
+    def create_interpolator(self, fin, fout, temp_num=1):
+        delta = (fin[1] - fin[0])
+        interp_idx = np.clip(np.floor_divide(fout - fin[0], delta), 0., len(fout))
+        interp_frac = np.maximum(np.mod(fout - fin[0], delta) / delta, 0.)
+
+        interp_idx = np.repeat(interp_idx[np.newaxis, np.newaxis, :], temp_num, axis=1)
+        temp_idx = np.repeat(np.arange(temp_num)[np.newaxis, :, np.newaxis], len(fout), axis=2)
+        interp_gather = np.stack([temp_idx, interp_idx], axis=-1)
+
+        interp_frac = np.repeat(interp_frac[np.newaxis, np.newaxis, :], temp_num, axis=1)
+
+        interp_gather = tf.convert_to_tensor(interp_gather, dtype=tf.int64)
+        interp_frac = tf.convert_to_tensor(interp_frac, dtype=tf.complex64)
+
+        def _interpolate(temp):
+            t_shape = tf.shape(temp)
+            g_shape = tf.shape(interp_gather)
+
+            batch_idx = tf.range(t_shape[0], dtype=tf.int64)
+            batch_idx = tf.expand_dims(batch_idx, axis=1)
+            batch_idx = tf.repeat(batch_idx, g_shape[1], axis=1)
+            batch_idx = tf.expand_dims(batch_idx, axis=2)
+            batch_idx = tf.repeat(batch_idx, g_shape[2], axis=2)
+            batch_idx = tf.expand_dims(batch_idx, axis=3)
+
+            gather = tf.repeat(interp_gather, t_shape[0], axis=0)
+            gather = tf.concat([batch_idx, gather], axis=3)
+
+            diff = tf.concat([temp[:, :, 1:] - temp[:, :, :-1],
+                              tf.zeros([t_shape[0], t_shape[1], 1], dtype=tf.complex64)],
+                             axis=2)
+            interp = (
+                tf.gather_nd(temp, gather)
+                + interp_frac * tf.gather_nd(diff, gather)
+            )
+            return interp
+
+        return _interpolate
+
+    def __init__(self, kernel_width, kernel_out, kernel_df, freqs, f_low, f_high,
+                 l1_reg=0., l2_reg=0.):
+        
+        super().__init__(freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
+
+        if len(kernel_width) != len(kernel_out):
+            raise ValueError("kernel_wdth and kernel_out must be the same length")
+        self.kernel_width = kernel_width
+        self.kernel_out = kernel_out
+        self.kernel_df = kernel_df
+
+        self.kernels = []
+        self.trainable_weights = {}
+        channels = 3
+        for i, (w, out) in enumerate(zip(kernel_width, kernel_out)):
+            kernel = tf.random.truncated_normal(
+                (1, w, channels, out),
+                dtype=tf.float32
+            )
+            kernel = tf.Variable(kernel, trainable=True)
+            self.kernels += [kernel]
+            self.trainable_weights['kernel_{0}'.format(i)] = kernel
+            channels = out
+
+        conv_freqs = np.arange(0., self.freqs[-1], self.kernel_df)
+        self.to_conv = self.create_interpolator(self.freqs.numpy(), conv_freqs)
+        self.from_conv = self.create_interpolator(conv_freqs, self.freqs.numpy(), temp_num=channels)
+
+    #@tf.function
+    def convolve(self, temp, training=False):
+
+        kernels = self.kernels
+        temp = self.to_conv(temp)
+
+        temp = tf.transpose(temp, perm=[0, 2, 1])
+        temp = tf.expand_dims(temp, axis=1)
+
+        temp = [temp, tf.math.conj(temp), real_to_complex(tf.math.abs(temp))]
+        temp = tf.concat(temp, axis=3)
+
+        temp_real = tf.math.real(temp)
+        temp_imag = tf.math.imag(temp)
+        
+        for k in self.kernels[:-1]:
+            temp_real = tf.nn.conv2d(temp_real, k, 1, 'SAME', data_format='NHWC')
+            temp_imag = tf.nn.conv2d(temp_imag, k, 1, 'SAME', data_format='NHWC')
+            
+            temp_real = tf.nn.relu(temp_real)
+            temp_imag = tf.nn.relu(temp_imag)
+
+        temp_real = tf.nn.conv2d(temp_real, self.kernels[-1], 1, 'SAME', data_format='NHWC')
+        temp_imag = tf.nn.conv2d(temp_imag, self.kernels[-1], 1, 'SAME', data_format='NHWC')
+
+        ctemp = tf.complex(temp_real, temp_imag)
+        ctemp = ctemp[:, 0, :, :]
+        ctemp = tf.transpose(ctemp, perm=[0, 2, 1])
+
+        ctemp = self.from_conv(ctemp)
+        ctemp = self.cut(ctemp)
+        ctemp = self.pad(ctemp)
+        return ctemp
+
+    def transform(self, temp, sample, training=False):
+        if tf.rank(temp) == 2:
+            temp = tf.expand_dims(temp, 1)
+        temp = self.convolve(temp, training=training)
+        return temp
+
+    @classmethod
+    def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
+        config = configparser.ConfigParser()
+        config.read(config_file)
+
+        kernel_width = [int(l) for l in config.get(section, "kernel-width").split(',')]
+        kernel_out = [int(l) for l in config.get(section, "kernel-out").split(',')]
+        kernel_df = config.getfloat(section, 'delta-f')
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
+
+        obj = cls(kernel_width, kernel_out, kernel_df, freqs, f_low, f_high,
+                  l1_reg=l1_reg, l2_reg=l2_reg)
+        return obj
+
+    def to_file(self, file_path, group=None, append=False):
+        if append:
+            file_mode = 'a'
+        else:
+            file_mode = 'w'
+
+        with h5py.File(file_path, file_mode) as f:
+            if group:
+                g = f.create_group(group)
+            else:
+                g = f
+            g.attrs['transformation_type'] = self.transformation_type
+            _ = g.create_dataset('kernel_width', data=np.array(self.kernel_width))
+            _ = g.create_dataset('kernel_out', data=np.array(self.kernel_out))
+            _ = g.create_dataset('kernel_df', data=np.array([self.kernel_df]))
+            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
+            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
+            for i in range(len(self.kernels)):
+                _ = g.create_dataset("kernel_{0}".format(i),
+                                     data=self.kernels[i].numpy())
+
+    @classmethod
+    def from_file(cls, file_path, freqs, f_low, f_high, group=None):
+        with h5py.File(file_path, 'r') as f:
+            if group:
+                g = f[group]
+            else:
+                g = f
+            kernel_width = list(g['kernel_wdith'])
+            kernel_out = list(g['kernel_out'])
+            kernel_df = g['kernel_df'][0]
+            l1_reg = g["l1_reg"][0]
+            l2_reg = g["l2_reg"][0]
+            kernels = []
+            for i in range(len(kernel_width)):
+                kernel = g['kernel_{0}'.format(i)][:]
+                kernels.append(kernel)
+
+        obj = cls(kernel_width, kernel_out, kernel_df, freqs, f_low, f_high,
+                  l1_reg=l1_reg, l2_reg=l2_reg)
+
+        obj.kernels = []
+        obj.trainable_weights = {}
+        for i, k in enumerate(kernels):
+            kernel = tf.convert_to_tensor(k, dtype=tf.float32)
+            kernel = tf.Variable(kernel, trainable=True)
+            obj.kernels += [kernel]
+            obj.trainable_weights['kernel_{0}'.format(i)] = kernel
+
+        return obj
+
+    def plot_model(self, bank, title=None):
+        fig, ax = plt.subplots(nrows=self.kernel_out[-1] + 1, ncols=3,
+                               figsize=(48, 6 * (self.kernel_out[-1] + 1)))
+
+        idxs = np.argsort(bank.table.mtotal)
+        idxs = [idxs[0], idxs[len(idxs) // 2], idxs[-1]]
+
+        for i, idx in enumerate(idxs):
+            base_ftemp = bank[idx]
+            ftemps = self.transform(base_ftemp.numpy()[np.newaxis, :].astype(np.complex64), None)
+            
+            base_temp = base_ftemp.to_timeseries()
+            base_temp = base_temp.cyclic_time_shift(2.5)
+            base_temp = base_temp.time_slice(base_temp.start_time, base_temp.start_time + 5.)
+
+            ax[0, i].plot(base_temp.sample_times, base_temp.numpy(), alpha=0.75)
+            ax[0, i].grid()
+
+            for j in range(self.kernel_out[-1]):
+                ftemp = FrequencySeries(ftemps[0, j, :].numpy().astype(np.complex128),
+                                        self.delta_f, epoch=0.)
+                temp = ftemp.to_timeseries()
+                temp = temp.cyclic_time_shift(2.5)
+                temp = temp.time_slice(temp.start_time, temp.start_time + 5.)
+
+                ax[j+1, i].plot(temp.sample_times, temp.numpy(), alpha=0.75)
+                ax[j+1, i].grid()
+
+        if title:
+            fig.suptitle(title, fontsize="large")
+
+        return fig, ax
+
+
 def select_transformation(transformation_key):
     options = {
         'polyshift': PolyShiftTransform,
         'netshift': NetShiftTransform,
-        'convolution': Convolution1DTransform
+        'convolution': Convolution1DTransform,
+        'cnn': CNNTransform
     }
 
     if transformation_key in options.keys():
