@@ -4,6 +4,7 @@ import argparse
 import logging
 import h5py
 from chisqnet.preprocessing import TriggerList, InjectionTriggers
+from copy import deepcopy
 
 
 parser = argparse.ArgumentParser()
@@ -26,18 +27,10 @@ parser.add_argument("--output-file", required=True,
                     help="Output location for training sample times")
 
 # Gather inputs for filtering triggers
-parser.add_argument("--snr-cut", type=float, default=0,
-                    help="Threshold for removing triggers below snr")
 parser.add_argument("--newsnr-cut", type=float, default=0,
                     help="Threshold for removing triggers below newsnr")
 parser.add_argument("--newsnr-sg-cut", type=float, default=0,
                     help="Threshold for removing triggers below newsnr_sg")
-parser.add_argument("--snr-upper", type=float, default=0,
-                    help="Threshold for removing triggers above snr")
-parser.add_argument("--newsnr-upper", type=float, default=0,
-                    help="Threshold for removing triggers above newsnr")
-parser.add_argument("--newsnr-sg-upper", type=float, default=0,
-                    help="Threshold for removing triggers above newsnr_sg")
 parser.add_argument("--cluster-param",
                     help="Parameter to use when clustering triggers")
 parser.add_argument("--cluster-window", type=float,
@@ -50,6 +43,11 @@ parser.add_argument("--keep-n-triggers", type=int,
 parser.add_argument("--inj-ifar-cut", type=float, default=0.,
                     help="Threshold for removing injection below IFAR")
 
+parser.add_argument("--snr-bins", type=float, nargs="+", required=True,
+                    help="The boundaries in SNR to select triggers")
+parser.add_argument("--count-per-bin", type=int, nargs="+", required=True,
+                    help="The number of triggers to keep for each SNR bin")
+
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
 
@@ -60,6 +58,12 @@ if args.verbose:
 else:
     log_level = logging.WARNING
 logging.basicConfig(format='%(asctime)s : %(message)s', level=log_level)
+
+if len(args.count_per_bin) == 1:
+    args.count_per_bin = args.count_per_bin * (len(args.snr_bins) - 1)
+
+if (len(args.snr_bins) - 1) != len(args.count_per_bin):
+    raise ValueError("--count-per-bin must be 1 smaller than --snr-bins or length 1")
 
 logging.info("Reading triggers from files.")
 if args.injfind_file is None:
@@ -84,11 +88,9 @@ for k, v in triggers.nums.items():
     logging.info("{0}: {1}".format(k, v))
     
 args.newsnr_cut = max(args.newsnr_cut, args.newsnr_sg_cut)
-args.snr_cut = max(args.snr_cut, args.newsnr_cut)
 
-if args.snr_cut:
-    triggers.threshold_cut(args.snr_cut, 'snr')
-    
+triggers.threshold_cut(args.snr_bins[0], 'snr')
+
 if args.newsnr_cut:
     triggers.get_newsnr()
     triggers.threshold_cut(args.newsnr_cut, 'newsnr')
@@ -96,18 +98,6 @@ if args.newsnr_cut:
 if args.newsnr_sg_cut:
     triggers.get_newsnr_sg()
     triggers.threshold_cut(args.newsnr_sg_cut, 'newsnr_sg')
-
-if args.newsnr_sg_upper:
-    triggers.threshold_cut(args.newsnr_sg_upper, 'newsnr_sg',
-                           above=False)
-
-if args.newsnr_upper:
-    triggers.threshold_cut(args.newsnr_upper, 'newsnr',
-                           above=False)
-
-if args.snr_upper:
-    triggers.threshold_cut(args.snr_upper, 'snr',
-                           above=False)
 
 logging.info("Triggers available after threshold cuts:")
 for k, v in triggers.nums.items():
@@ -121,12 +111,29 @@ logging.info("Triggers available after clustering:")
 for k, v in triggers.nums.items():
     logging.info("{0}: {1}".format(k, v))
 
-if args.keep_n_triggers:
-    triggers.sample(args.keep_n_triggers)
+keeps = None
+for i in range(len(args.count_per_bin)):
+    snr_min = args.snr_bins[i]
+    snr_max = args.snr_bins[i + 1]
+    count = args.count_per_bin[i]
+    bin_triggers = deepcopy(triggers)
+    bin_triggers.threshold_cut(snr_min, 'snr')
+    bin_triggers.threshold_cut(snr_max, 'snr', above=False)
+    bin_triggers.sample(count)
+    logging.info("Triggers in SNR bin {0} -> {1}:".format(snr_min, snr_max))
+    real_count = 0
+    for k, v in bin_triggers.nums.items():
+        logging.info("{0}: {1}".format(k, v))
+        real_count += v
+    logging.info("Triggers collected {0} out of {1} requested".format(real_count, count))
+    if keeps is None:
+        keeps = bin_triggers
+    else:
+        keeps.append(bin_triggers)
 
-triggers.get_bank_params(args.bank_file)
+keeps.get_bank_params(args.bank_file)
 
 logging.info("Saving triggers")
-triggers.write_to_hdf(args.output_file)
+keeps.write_to_hdf(args.output_file)
 
 logging.info("Done!")
