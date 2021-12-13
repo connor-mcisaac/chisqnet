@@ -62,13 +62,14 @@ with h5py.File(args.output_model_file, 'w') as f:
 with open(args.output_txt_file, 'w') as f:
     options = 'statistic-keywords ='
     options += ' sngl_ranking_threshold:{0}'.format(file_data.datasets['threshold'][0])
-    options += ' sngl_ranking_power:{0}'.format(file_data.datasets['power'][0])
     options += ' sngl_ranking_constant:{0}'.format(file_data.datasets['constant'][0])
+    options += ' sngl_ranking_alpha:{0}'.format(file_data.datasets['alpha'][0])
+    options += ' sngl_ranking_beta:{0}'.format(file_data.datasets['beta'][0])
     options += '\n\n'
     options += 'chisqnet-threshold = {0}\n'.format(file_data.datasets['threshold'][0])
-    options += 'chisqnet-power = {0}\n'.format(file_data.datasets['power'][0])
     options += 'chisqnet-constant = {0}\n'.format(file_data.datasets['constant'][0])
-
+    options += 'chisqnet-alpha = {0}\n'.format(file_data.datasets['alpha'][0])
+    options += 'chisqnet-beta = {0}\n'.format(file_data.datasets['beta'][0])
     f.write(options)
 
 logging.info("Done!")

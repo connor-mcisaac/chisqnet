@@ -6,11 +6,10 @@ import h5py
 import numpy as np
 from chisqnet.filtering import ChisqFilter
 from pycbc import waveform
+from pycbc.types import complex64
 import tensorflow as tf
 import pycbc.results
 
-
-parser = argparse.ArgumentParser()
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-file", required=True,
@@ -28,11 +27,12 @@ with h5py.File(args.model_file, 'r') as f:
 
 chisq_transform = ChisqFilter.from_file(
      args.model_file,
-     np.arange(10), 1., 10.,
+     np.arange(1024. * 100 + 1) * 0.01, 10., 1024.,
      group="model_epoch_{0}".format(epoch)
 )
 
-bank = waveform.TemplateBank(args.bank_file)
+bank = waveform.FilterBank(args.bank_file, 1024 * 100 + 1, 0.01, complex64,
+                           low_frequency_cutoff=12., approximant='SEOBNRv4_ROM')
 fig, ax = chisq_transform.transform.plot_model(bank)
 
 caption = "This is a plot of the trained transform after all training is complete."
