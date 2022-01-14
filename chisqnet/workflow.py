@@ -265,6 +265,17 @@ class MergeSamplesExecutable(Executable):
         return node
 
 
+class CompareExecutable(Executable):
+    
+    current_retention_level = Executable.MERGED_TRIGGERS
+    def create_node(self, samples, bank):
+        node = Node(self)
+        node.add_input_opt('--input-file', training_samples)
+        node.add_input_opt('--bank-file', bank)
+        node.new_output_file_opt(samples.segment, '.hdf', '--output-file')
+        return node
+
+
 class PrepareSamplesExecutable(Executable):
     
     current_retention_level = Executable.MERGED_TRIGGERS
