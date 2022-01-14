@@ -12,25 +12,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def abs_loss(snr_prime, snr, injs):
-    snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-
-    trig_loss = snr_prime_thresh - 4.
-    inj_loss = snr - snr_prime
-
-    batch_loss = tf.where(injs, inj_loss, trig_loss)
-    return batch_loss
-
-
-def sqr_loss(snr_prime, snr, injs):
-    snr_prime_thresh = tf.maximum(snr_prime, tf.ones_like(snr_prime) * 4.)
-
-    trig_loss = (snr_prime_thresh - 4.) ** 2.
-    inj_loss = (snr - snr_prime) ** 2.
-
-    batch_loss = tf.where(injs, inj_loss, trig_loss)
-    return batch_loss
-
 
 parser = argparse.ArgumentParser()
 
@@ -83,6 +64,10 @@ parser.add_argument("--learning-rate", default=0.001, type=float,
                     help="The learning rate passed to the training optimizer")
 parser.add_argument("--learning-rate-decay", default=1., type=float,
                     help="The value to multiply the learning rate by after each epoch")
+parser.add_argument("--loss-snr-threshold", default=4., type=float,
+                    help="The SNR below which trigger loss is 0")
+parser.add_argument("--loss-keyword-args", nargs='+',
+                    help="Keyword arguments for the loss function")
 
 # Gather arguments for transform
 parser.add_argument("--config-file", required=True,
@@ -106,7 +91,7 @@ tf.config.threading.set_inter_op_parallelism_threads(args.ncores)
 
 from chisqnet.filtering import ChisqFilter
 from chisqnet.training_utils import SampleFile, chi2, nc_chi2
-
+from chisqnet.loss import select_loss
 
 if args.verbose:
     log_level = logging.DEBUG
@@ -161,9 +146,7 @@ trainable_names = [k for k in train.keys()]
 trainable_names.sort()
 trainable_weights = [train[k] for k in trainable_names]
 
-loss_fns = {'absolute': abs_loss,
-            'squared': sqr_loss}
-loss_fn = loss_fns[args.loss_function]
+loss_fn = select_loss(args.loss_function).from_cli(args)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
 
@@ -226,19 +209,18 @@ for i in range(args.epochs):
         start = time.time()
 
         segs, psds, temp, injs, gather_idxs, params = \
-            training_samples.get_tensors(idxs, bank)
+            training_samples.get_tensors(idxs, bank, cuts=True)
 
         logging.info("Batch inputs read")
 
         with tf.GradientTape() as tape:
 
             snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
-                temp, segs, psds, params,
-                gather_idxs=gather_idxs,
+                temp, segs, psds, params, gather_idxs=gather_idxs,
                 max_snr=True, training=True
             )
 
-            batch_loss = loss_fn(snr_prime, snr, injs)
+            batch_loss = loss_fn(snr_prime, snr, injs, training=True)
             loss = tf.reduce_mean(batch_loss)
 
             loss += chisq_transform.get_regulariser_loss()
@@ -266,9 +248,7 @@ for i in range(args.epochs):
         inj_losses += [np.sum(batch_loss.numpy()[inj_lgc])]
         trig_losses += [np.sum(batch_loss.numpy()[trig_lgc])]
 
-        snr_prime_above = tf.maximum(snr_prime - 4., tf.zeros_like(snr_prime))
-        snr_above = tf.maximum(snr - 4., tf.ones_like(snr) * 1e-3)
-        snr_removed += [np.sum(1 - (snr_prime_above / snr_above).numpy()[trig_lgc])]
+        snr_removed += [np.sum(1 - (snr_prime / snr).numpy()[trig_lgc])]
         inj_removed += [np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])]
 
         times += time.time() - start
@@ -285,7 +265,6 @@ for i in range(args.epochs):
               + "Av. Loss: {0:3.4f}, ".format(np.sum(losses) / (j + 1))
               + "Av. Inj Loss: {0:3.4f}, ".format(np.sum(inj_losses) / max(np.sum(inj_count), 1))
               + "Av. Trig Loss: {0:3.4f}, ".format(np.sum(trig_losses) / max(np.sum(trig_count), 1))
-              + "Av. Trig SNR Frac Removed: {0:1.4f}, ".format(np.sum(snr_removed) / max(np.sum(trig_count), 1))
               + "Av. Time: {0:6.2f}".format(times / (j + 1)),
               end=end_str)
 
@@ -328,17 +307,16 @@ for i in range(args.epochs):
             start = time.time()
 
             segs, psds, temp, injs, gather_idxs, params = \
-                validation_samples.get_tensors(idxs, bank)
+                validation_samples.get_tensors(idxs, bank, cuts=True)
 
             logging.info("Batch inputs read")
 
             snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
-                temp, segs, psds, params,
-                gather_idxs=gather_idxs,
+                temp, segs, psds, params, gather_idxs=gather_idxs,
                 max_snr=True, training=False
             )
 
-            batch_loss = loss_fn(snr_prime, snr, injs)
+            batch_loss = loss_fn(snr_prime, snr, injs, training=False)
             val_loss += tf.reduce_sum(batch_loss)
 
             logging.info("Loss calculated")
@@ -354,9 +332,7 @@ for i in range(args.epochs):
             val_inj_loss += np.sum(batch_loss.numpy()[inj_lgc])
             val_trig_loss += np.sum(batch_loss.numpy()[trig_lgc])
 
-            snr_prime_above = tf.maximum(snr_prime - 4., tf.zeros_like(snr_prime))
-            snr_above = tf.maximum(snr - 4., tf.ones_like(snr) * 1e-3)
-            val_snr_removed += np.sum(1 - (snr_prime_above / snr_above).numpy()[trig_lgc])
+            val_snr_removed += np.sum(1 - (snr_prime / snr).numpy()[trig_lgc])
             val_inj_removed += np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])
 
             if np.sum(trig_lgc):
@@ -379,7 +355,6 @@ for i in range(args.epochs):
                   + "Av. Loss: {0:3.4f}, ".format(val_loss / total_count)
                   + "Av. Inj Loss: {0:3.4f}, ".format(val_inj_loss / max(val_inj_count, 1))
                   + "Av. Trig Loss: {0:3.4f}, ".format(val_trig_loss / max(val_trig_count, 1))
-                  + "Av. Trig SNR Frac Removed: {0:1.4f}, ".format(val_snr_removed / max(val_trig_count, 1))
                   + "Av. Time: {0:6.2f}".format(val_times / (k + 1)),
                   end=end_str)
 

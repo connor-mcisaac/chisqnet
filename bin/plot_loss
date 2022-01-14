@@ -66,12 +66,12 @@ ax[1, 1].plot(validation_batch, validation_snr_removed, alpha=0.75, label='Valid
 ax[0, 1].grid()
 ax[0, 1].legend()
 ax[0, 1].set_xlabel('Batches', fontsize='large')
-ax[0, 1].set_ylabel('Average Fraction SNR > 4 Removed', fontsize='large')
+ax[0, 1].set_ylabel('Average Fraction SNR Removed', fontsize='large')
 
 ax[1, 1].grid()
 ax[1, 1].legend()
 ax[1, 1].set_xlabel('Batches', fontsize='large')
-ax[1, 1].set_ylabel('Average Fraction SNR > 4 Removed', fontsize='large')
+ax[1, 1].set_ylabel('Average Fraction SNR Removed', fontsize='large')
 
 ax[0, 2].plot(training_batch, training_inj_removed, alpha=0.75, label='Training')
 ax[1, 2].plot(validation_batch, validation_inj_removed, alpha=0.75, label='Validation')

@@ -17,15 +17,20 @@ class SampleFile(object):
             self.tlen = f.attrs['tlen']
             self.sample_rate = f.attrs['sample_rate']
             self.num = f['stilde'].len()
+            self.num_injections = np.sum(f['injection'][:])
+            self.num_noise = self.num - self.num_injections
 
-    def get_samples(self, idxs):
+    def get_samples(self, idxs, cuts=False):
         with h5py.File(self.fp, 'r') as f:
             segs = f['stilde'][idxs, :]
             psds = f['psd'][idxs, :]
-            cuts = f['cut'][idxs, :]
             tids = f['template_id'][idxs]
             injs = f['injection'][idxs]
-        return segs, psds, cuts, tids, injs
+            if cuts:
+                peak = f['cut'][idxs, :]
+            else:
+                peak = f['chisqnet_idx'][idxs]
+        return segs, psds, tids, injs, peak
 
     def get_param(self, param, idxs):
         with h5py.File(self.fp, 'r') as f:
@@ -52,22 +57,24 @@ class SampleFile(object):
         params = self.get_params(param, idxs)
         return np.min(params), np.max(params)
 
-    def get_tensors(self, idxs, bank):
-        segs, psds, cuts, tids, injs = self.get_samples(idxs)
+    def get_tensors(self, idxs, bank, cuts=False):
+        segs, psds, tids, injs, peak = self.get_samples(idxs, cuts=cuts)
         temp = np.stack([bank[tid].numpy().copy() for tid in tids])
-        gather_idxs = np.zeros((len(idxs), cuts[0, 1] - cuts[0, 0], 2), dtype=int)
-        for k, cut in enumerate(cuts):
-            gather_idxs[k, :, 0] = k
-            gather_idxs[k, :, 1] = np.arange(cut[0], cut[1])
+        snr_idxs = peak
+        if cuts:
+            snr_idxs = np.zeros((len(idxs), peak[0, 1] - peak[0, 0], 2), dtype=int)
+            for k, cut in enumerate(peak):
+                snr_idxs[k, :, 0] = k
+                snr_idxs[k, :, 1] = np.arange(cut[0], cut[1])
         params = self.get_template_params(idxs=idxs)
 
         segs = tf.convert_to_tensor(segs, dtype=tf.complex64)
         psds = tf.convert_to_tensor(psds, dtype=tf.float32)
         temp = tf.convert_to_tensor(temp, dtype=tf.complex64)
         injs = tf.convert_to_tensor(injs, dtype=tf.bool)
-        gather_idxs = tf.convert_to_tensor(gather_idxs, dtype=tf.int64)
+        snr_idxs = tf.convert_to_tensor(snr_idxs, dtype=tf.int64)
 
-        return segs, psds, temp, injs, gather_idxs, params
+        return segs, psds, temp, injs, snr_idxs, params
 
 
 def chi2(x, df):
