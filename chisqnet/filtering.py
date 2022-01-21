@@ -191,7 +191,7 @@ class MatchedFilter(BaseFilter):
         mask = tf.cast(lgc, tf.complex64)
 
         sigma = tf.where(lgc, sigma, tf.ones_like(sigma))
-        norm_temp = mask * temp / tf.stop_gradient(sigma)
+        norm_temp = mask * temp / sigma
 
         ow_data = data / real_to_complex(psd)
 
@@ -263,8 +263,8 @@ class BaseTransform(BaseFilter):
         temp_sigma = self.sigma(temp, psd)
         base_sigma = self.sigma(base, psd)
 
-        temp_norm = temp / tf.stop_gradient(temp_sigma)
-        base_norm = base / tf.stop_gradient(base_sigma)
+        temp_norm = temp / temp_sigma
+        base_norm = base / base_sigma
 
         inner = 4 * self.delta_f * tf.math.conj(base_norm) * temp_norm / real_to_complex(psd)
         overlap_cplx = tf.math.reduce_sum(inner, axis=2, keepdims=True)
@@ -1022,10 +1022,7 @@ class ShiftTransform(BaseTransform):
             temp = tf.expand_dims(temp, 1)
         temp = tf.repeat(temp, tf.shape(df)[1], axis=1)
         temp = self.shift_dt(temp, dt)
-        if training:
-            temp = self.shift_df(temp, df)
-        else:
-            temp = self.fast_shift_df(temp, df)
+        temp = self.fast_shift_df(temp, df)
         return temp
 
 
@@ -1090,7 +1087,7 @@ class PolyShiftTransform(ShiftTransform):
         df_terms = dfs * df_scale
         df = tf.math.reduce_sum(df_terms, axis=2)
 
-        return no_grad_mul(dt, self.dt_base), no_grad_mul(df, self.df_base)
+        return dt * self.dt_base, df * self.df_base
 
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
@@ -1201,10 +1198,11 @@ class PolyShiftTransform(ShiftTransform):
 class NetShiftTransform(ShiftTransform):
     transformation_type = "netshift"
 
-    def __init__(self, nshifts, dt_max, df_max, template_df, layers,
+    def __init__(self, nshifts, dt_max, df_max, template_df,
+                 shared_layers, shift_layers,
                  freqs, f_low, f_high,
                  min_freq=None, max_freq=None,
-                 l1_reg=0., l2_reg=0.):
+                 l1_reg=0., l2_reg=0., dropout=0.):
         
         super().__init__(freqs, f_low, f_high, l1_reg=l1_reg, l2_reg=l2_reg)
 
@@ -1213,7 +1211,8 @@ class NetShiftTransform(ShiftTransform):
         self.df_max = df_max
 
         self.template_df = template_df
-        self.layers = layers
+        self.shared_layers = shared_layers
+        self.shift_layers = shift_layers
 
         if min_freq is None:
             min_freq = f_low
@@ -1223,55 +1222,88 @@ class NetShiftTransform(ShiftTransform):
         self.min_freq = min_freq
         self.max_freq = max_freq
 
+        self.dropout = dropout
+
         template_freqs = np.arange(min_freq, max_freq, template_df)
         self.to_dense = create_interpolator(self.freqs.numpy(), template_freqs)
 
-        self.weights = []
-        self.biases = []
-        self.means = []
-        self.variances = []
         self.trainable_weights = {}
+        self.shared_weights = []
+        self.shared_biases = []
+
         in_layer = len(template_freqs)
-        for i, n in enumerate(layers + [2 * nshifts]):
+        for i, n in enumerate(shared_layers):
             weight = tf.random.truncated_normal(
                 (in_layer, n),
                 stddev=tf.cast(tf.math.sqrt(2. / (in_layer + n)), tf.float32),
                 dtype=tf.float32
             )
-            self.weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
-            self.trainable_weights['weight_{0}'.format(i)] = self.weights[i]
+            self.shared_weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+            self.trainable_weights['shared_weight_{0}'.format(i)] = self.shared_weights[i]
+                
             bias = tf.zeros((n,), dtype=tf.float32)
-            self.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
-            self.trainable_weights['bias_{0}'.format(i)] = self.biases[i]
-            if i != len(layers):
-                self.means += [tf.zeros((n,), dtype=tf.float32)]
-                self.variances += [tf.ones((n,), dtype=tf.float32)]
+            self.shared_biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+            self.trainable_weights['shared_bias_{0}'.format(i)] = self.shared_biases[i]
+            
             in_layer = n
+
+        self.shift_weights = []
+        self.shift_biases = []
+
+        for i in range(nshifts):
+            self.shift_weights.append([])
+            self.shift_biases.append([])
+
+            in_layer = shared_layers[-1]
+            for j, n in enumerate(shift_layers + [2]):
+                weight = tf.random.truncated_normal(
+                    (in_layer, n),
+                    stddev=tf.cast(tf.math.sqrt(2. / (in_layer + n)), tf.float32),
+                    dtype=tf.float32
+                )
+                self.shift_weights[i] += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['shift_{0}_weight_{1}'.format(i, j)] = self.shift_weights[i][j]
+                
+                bias = tf.zeros((n,), dtype=tf.float32)
+                self.shift_biases[i] += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+                self.trainable_weights['shift_{0}_bias_{1}'.format(i, j)] = self.shift_biases[i][j]
+                in_layer = n
 
     def dense(self, temp, training=False):
         ntemp = tf.math.abs(temp)
         ntemp = self.to_dense(ntemp)
-        ntemp = ntemp / tf.math.reduce_std(ntemp, axis=2, keepdims=True)
+        ntemp = ntemp / tf.math.reduce_mean(ntemp, axis=2, keepdims=True)
 
-        for i in range(len(self.weights) - 1):
-            ntemp = tf.matmul(ntemp, self.weights[i]) + self.biases[i]
-            if training:
-                batch_mean = tf.math.reduce_mean(ntemp, axis=0, keepdims=True)
-                self.means[i] = 0.99 * self.means[i] + 0.01 * batch_mean
-                batch_variance = tf.math.reduce_variance(ntemp, axis=0, keepdims=True)
-                self.variances[i] = 0.99 * self.variances[i] + 0.01 * batch_variance
-                ntemp = (ntemp - batch_mean) / (batch_variance + 1e-6) ** 0.5
-                ntemp = tf.nn.dropout(ntemp, 0.5)
+        for i in range(len(self.shared_weights)):
+            if i == 0:
+                feature = tf.matmul(ntemp, self.shared_weights[i]) + self.shared_biases[i]
             else:
-                ntemp = (ntemp - self.means[i]) / (self.variances[i] + 1e-6) ** 0.5
-            ntemp = tf.nn.relu(ntemp)
+                feature = tf.matmul(feature, self.shared_weights[i]) + self.shared_biases[i]
+            feature = tf.nn.relu(feature)
             if training:
-                ntemp = tf.nn.dropout(ntemp, 0.5)
-        ntemp = tf.matmul(ntemp, self.weights[-1]) + self.biases[-1]
-        ntemp = tf.math.tanh(ntemp)
+                feature = tf.nn.dropout(feature, self.dropout)
 
-        dt, df = tf.split(ntemp, 2, axis=2)
-        return no_grad_mul(dt, self.dt_max), no_grad_mul(df, self.df_max)
+        dts = []
+        dfs = []
+        
+        for i in range(self.nshifts):
+            for j in range(len(self.shift_weights[i]) - 1):
+                if j == 0:
+                    value = tf.matmul(feature, self.shift_weights[i][j]) + self.shift_biases[i][j]
+                else:
+                    value = tf.matmul(value, self.shift_weights[i][j]) + self.shift_biases[i][j]
+                value = tf.nn.relu(value)
+                if training:
+                    value = tf.nn.dropout(value, self.dropout)
+            value = tf.matmul(value, self.shift_weights[i][-1]) + self.shift_biases[i][-1]
+            value = tf.math.tanh(value)
+            dt, df = tf.split(value, 2, axis=2)
+            dts += [dt]
+            dfs += [df]
+        dts = tf.concat(dts, axis=2)
+        dfs = tf.concat(dfs, axis=2)
+
+        return dts * self.dt_max, dfs * self.df_max
 
     def transform(self, temp, sample, training=False):
         if tf.rank(temp) == 2:
@@ -1280,10 +1312,7 @@ class NetShiftTransform(ShiftTransform):
         if tf.shape(temp)[1] == 1:
             temp = tf.repeat(temp, tf.shape(df)[2], axis=1)
         temp = self.shift_dt(temp, dt[:, 0, :])
-        if training:
-            temp = self.shift_df(temp, df[:, 0, :])
-        else:
-            temp = self.fast_shift_df(temp, df[:, 0, :])
+        temp = self.fast_shift_df(temp, df[:, 0, :])
         return temp
 
     @classmethod
@@ -1295,16 +1324,19 @@ class NetShiftTransform(ShiftTransform):
         dt_max = config.getfloat(section, "max-time-shift")
         df_max = config.getfloat(section, "max-freq-shift")
         template_df = config.getfloat(section, "template-df")
-        layers = [int(l) for l in config.get(section, "layers").split(',')]
+        shared_layers = [int(l) for l in config.get(section, "shared-layers").split(',')]
+        shift_layers = [int(l) for l in config.get(section, "shift-layers").split(',')]
         min_freq = config.getfloat(section, "min-freq", fallback=None)
         max_freq = config.getfloat(section, "max-freq", fallback=None)
         l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
         l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
+        dropout = config.getfloat(section, "dropout", fallback=0.)
 
         obj = cls(nshifts, dt_max, df_max,
-                  template_df, layers, freqs, f_low, f_high,
+                  template_df, shared_layers, shift_layers,
+                  freqs, f_low, f_high,
                   min_freq=min_freq, max_freq=max_freq,
-                  l1_reg=l1_reg, l2_reg=l2_reg)
+                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -1328,16 +1360,12 @@ class NetShiftTransform(ShiftTransform):
             _ = g.create_dataset('max_freq', data=np.array([self.max_freq]))
             _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
             _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
+            _ = g.create_dataset("dropout", data=np.array([self.dropout]))
             for i in range(len(self.weights)):
                 _ = g.create_dataset("weight_{0}".format(i),
                                      data=self.weights[i].numpy())
                 _ = g.create_dataset("bias_{0}".format(i),
                                      data=self.biases[i].numpy())
-            for i in range(len(self.means)):
-                _ = g.create_dataset("mean_{0}".format(i),
-                                     data=self.means[i].numpy())
-                _ = g.create_dataset("variance_{0}".format(i),
-                                     data=self.variances[i].numpy())
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -1355,6 +1383,7 @@ class NetShiftTransform(ShiftTransform):
             max_freq = g['max_freq'][0]
             l1_reg = g["l1_reg"][0]
             l2_reg = g["l2_reg"][0]
+            dropout = g["dropout"][0]
             weights = []
             biases = []
             means = []
@@ -1362,14 +1391,11 @@ class NetShiftTransform(ShiftTransform):
             for i in range(len(layers) + 1):
                 weights += [g['weight_{0}'.format(i)][:]]
                 biases += [g['bias_{0}'.format(i)][:]]
-            for i in range(len(layers)):
-                means += [g['mean_{0}'.format(i)][:]]
-                variances += [g['variance_{0}'.format(i)][:]]
 
         obj = cls(nshifts, dt_max, df_max,
                   template_df, layers, freqs, f_low, f_high,
                   min_freq=min_freq, max_freq=max_freq,
-                  l1_reg=l1_reg, l2_reg=l2_reg)
+                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
 
         obj.weights = []
         obj.biases = []
@@ -1381,10 +1407,6 @@ class NetShiftTransform(ShiftTransform):
             bias = tf.convert_to_tensor(biases[i], dtype=tf.float32)
             obj.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
             obj.trainable_weights['bias_{0}'.format(i)] = obj.biases[i]
-        obj.means = []
-        for i in range(len(layers)):
-            obj.means += [tf.convert_to_tensor(means[i], dtype=tf.float32)]
-            obj.variances += [tf.convert_to_tensor(variances[i], dtype=tf.float32)]
 
         return obj
 
@@ -1426,6 +1448,124 @@ class NetShiftTransform(ShiftTransform):
         cbar.ax.set_ylabel(param, fontsize='large')
 
         return fig, ax
+
+
+class QuadNetShiftTransform(NetShiftTransform):
+    transformation_type = "quadnetshift"
+
+    def __init__(self, dt_max, df_max, template_df,
+                 shared_layers, shift_layers,
+                 freqs, f_low, f_high,
+                 min_freq=None, max_freq=None,
+                 l1_reg=0., l2_reg=0., dropout=0.):
+        
+        super().__init__(4, dt_max, df_max, template_df,
+                         shared_layers, shift_layers,
+                         freqs, f_low, f_high,
+                         min_freq=min_freq, max_freq=max_freq,
+                         l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
+
+    def dense(self, temp, training=False):
+        ntemp = tf.math.abs(temp)
+        ntemp = self.to_dense(ntemp)
+        ntemp = ntemp / tf.math.reduce_mean(ntemp, axis=2, keepdims=True)
+
+        for i in range(len(self.shared_weights)):
+            if i == 0:
+                feature = tf.matmul(ntemp, self.shared_weights[i]) + self.shared_biases[i]
+            else:
+                feature = tf.matmul(feature, self.shared_weights[i]) + self.shared_biases[i]
+            feature = tf.nn.relu(feature)
+            if training:
+                feature = tf.nn.dropout(feature, self.dropout)
+
+        dts = []
+        dfs = []
+        
+        for i, (t_sign, f_sign) in enumerate(zip([1., 1., -1., -1.], [1., -1., 1., -1.])):
+            for j in range(len(self.shift_weights[i]) - 1):
+                if j == 0:
+                    value = tf.matmul(feature, self.shift_weights[i][j]) + self.shift_biases[i][j]
+                else:
+                    value = tf.matmul(value, self.shift_weights[i][j]) + self.shift_biases[i][j]
+                value = tf.nn.relu(value)
+                if training:
+                    value = tf.nn.dropout(value, self.dropout)
+            value = tf.matmul(value, self.shift_weights[i][-1]) + self.shift_biases[i][-1]
+            value = tf.math.tanh(value) * 0.5
+            dt, df = tf.split(value, 2, axis=2)
+            dts += [dt + 0.5 * t_sign]
+            dfs += [df + 0.5 * f_sign]
+        dts = tf.concat(dts, axis=2)
+        dfs = tf.concat(dfs, axis=2)
+
+        return dts * self.dt_max, dfs * self.df_max
+
+    @classmethod
+    def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
+        config = configparser.ConfigParser()
+        config.read(config_file)
+
+        dt_max = config.getfloat(section, "max-time-shift")
+        df_max = config.getfloat(section, "max-freq-shift")
+        template_df = config.getfloat(section, "template-df")
+        shared_layers = [int(l) for l in config.get(section, "shared-layers").split(',')]
+        shift_layers = [int(l) for l in config.get(section, "shift-layers").split(',')]
+        min_freq = config.getfloat(section, "min-freq", fallback=None)
+        max_freq = config.getfloat(section, "max-freq", fallback=None)
+        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
+        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
+        dropout = config.getfloat(section, "dropout", fallback=0.)
+
+        obj = cls(dt_max, df_max,
+                  template_df, shared_layers, shift_layers,
+                  freqs, f_low, f_high,
+                  min_freq=min_freq, max_freq=max_freq,
+                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
+        return obj
+
+    @classmethod
+    def from_file(cls, file_path, freqs, f_low, f_high, group=None):
+        with h5py.File(file_path, 'r') as f:
+            if group:
+                g = f[group]
+            else:
+                g = f
+            nshifts = g["nshifts"][0]
+            dt_max = g["dt_max"][0]
+            df_max = g["df_max"][0]
+            template_df = g['template_df'][0]
+            layers = [int(l) for l in g['layers'][:]]
+            min_freq = g['min_freq'][0]
+            max_freq = g['max_freq'][0]
+            l1_reg = g["l1_reg"][0]
+            l2_reg = g["l2_reg"][0]
+            dropout = g["dropout"][0]
+            weights = []
+            biases = []
+            means = []
+            variances = []
+            for i in range(len(layers) + 1):
+                weights += [g['weight_{0}'.format(i)][:]]
+                biases += [g['bias_{0}'.format(i)][:]]
+
+        obj = cls(dt_max, df_max,
+                  template_df, layers, freqs, f_low, f_high,
+                  min_freq=min_freq, max_freq=max_freq,
+                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
+
+        obj.weights = []
+        obj.biases = []
+        obj.trainable_weights = {}
+        for i in range(len(layers) + 1):
+            weight = tf.convert_to_tensor(weights[i], dtype=tf.float32)
+            obj.weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+            obj.trainable_weights['weight_{0}'.format(i)] = obj.weights[i]
+            bias = tf.convert_to_tensor(biases[i], dtype=tf.float32)
+            obj.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+            obj.trainable_weights['bias_{0}'.format(i)] = obj.biases[i]
+
+        return obj
 
 
 class Convolution1DTransform(BaseTransform):
@@ -2080,6 +2220,7 @@ def select_transformation(transformation_key):
     options = {
         'polyshift': PolyShiftTransform,
         'netshift': NetShiftTransform,
+        'quadnetshift': QuadNetShiftTransform,
         'convolution': Convolution1DTransform,
         'cnn': CNNTransform,
         'dense': DenseTransform
