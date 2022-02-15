@@ -8,36 +8,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
-@tf.custom_gradient
-def print_gradient(x, name):
-    def grad(upstream):
-        print(name)
-        print(upstream)
-        return upstream, None
-    return x, grad
-
-
-@tf.custom_gradient
-def divide_gradient(x, y):
-    def grad(upstream):
-        return upstream / y, None
-    return x, grad
-
-
-@tf.custom_gradient
-def no_grad_div(x, y):
-    def grad(upstream):
-        return upstream, None
-    return x / y, grad
-
-
-@tf.custom_gradient
-def no_grad_mul(x, y):
-    def grad(upstream):
-        return upstream, None
-    return x * y, grad
-
-
 def real_to_complex(real):
     imag = tf.zeros_like(real, dtype=tf.float32)
     return tf.complex(real, imag)
@@ -286,10 +256,6 @@ class BaseTransform(BaseFilter):
         err += "Implement this method before using this class."
         raise NotImplementedError(err)
 
-    def pycbc_transform(self, temp, params):
-        temp = self.transform(temp, params, training=False)
-        return temp
-
     @classmethod
     def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
 
@@ -324,213 +290,15 @@ class BaseTransform(BaseFilter):
         return loss
 
 
-class TemplateMixer(object):
-
-    def __init__(self, templates_in, templates_out, layer_sizes,
-                 params, params_base, l1_reg=0., l2_reg=0.):
-        self.templates_in = templates_in
-        self.templates_out = templates_out
-
-        self.l1_reg = l1_reg
-        self.l2_reg = l2_reg
-        
-        if isinstance(params, list):
-            self.params = params
-        else:
-            self.params = [params]
-
-        if isinstance(params_base, list):
-            self.params_base = params_base
-        else:
-            self.params_base = [params_base]
-
-        shapes = [len(params)] + layer_sizes + [templates_in]
-        self.weights = []
-        self.biases = []
-        self.trainable_weights = {}
-
-        for i in range(templates_out):
-            self.weights.append([])
-            self.biases.append([])
-            for j in range(len(shapes) - 1):
-                weight = tf.random.truncated_normal(
-                    (shapes[j], shapes[j + 1]),
-                    stddev=tf.math.sqrt(2 / (shapes[j] + shapes[j + 1])),
-                    dtype=tf.float32
-                )
-                self.weights[i] += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
-                self.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = self.weights[i][j]
-
-                bias = tf.zeros((shapes[j + 1],), dtype=tf.float32)
-                self.biases[i] += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
-                self.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = self.biases[i][j]
-
-    def get_mixer(self, sample, training=False):
-        params = [sample[p] / pb for p, pb in zip(self.params, self.params_base)]
-        params = np.stack(params, axis=-1)
-
-        mixes = []
-        for ws, bs in zip(self.weights, self.biases):
-            values = tf.convert_to_tensor(params[:].astype(np.float32), dtype=tf.float32)
-            for w, b in zip(ws[:-1], bs[:-1]):
-                values = tf.matmul(values, w) + b
-                values = tf.nn.relu(values)
-            values = tf.matmul(values, ws[-1]) + bs[-1]
-            values = 1e-6 + (1 - 1e-6) * tf.math.sigmoid(values)
-            if training:
-                noise = tf.random.truncated_normal(tf.shape(values), stddev=0.1)
-                values = values + noise
-            values = values / tf.reduce_sum(values, axis=1, keepdims=True)
-            mixes += [values]
-
-        mixer = tf.stack(mixes, axis=-1)
-        return mixer
-
-    def mix_temps(self, temps, sample, training=False):
-        mixer = self.get_mixer(sample, training=training)
-        mixer = real_to_complex(mixer)
-
-        temps = tf.transpose(temps, perm=[0, 2, 1])
-        temps = tf.matmul(temps, mixer)
-        temps = tf.transpose(temps, perm=[0, 2, 1])
-
-        return temps
-
-    @classmethod
-    def from_config(cls, config_file, section="model"):
-        config = configparser.ConfigParser()
-        config.read(config_file)
-
-        templates_in = config.getint(section, 'templates-in')
-        templates_out = config.getint(section, 'templates-out')
-        layer_sizes = [int(l) for l in config.get(section, "layer-sizes").split(',')]
-        params = config.get(section, "params").split(',')
-        params_base = [float(p) for p in config.get(section, "params-base").split(',')]
-        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
-        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
-
-
-        obj = cls(templates_in, templates_out, layer_sizes,
-                  params, params_base, l1_reg=l1_reg, l2_reg=l2_reg)
-        return obj
-
-    def to_file(self, file_path, group=None, append=False):
-        if append:
-            file_mode = 'a'
-        else:
-            file_mode = 'w'
-
-        with h5py.File(file_path, file_mode) as f:
-            if group:
-                g = f.create_group(group)
-            else:
-                g = f
-            _ = g.create_dataset('templates_out', data=np.array([self.templates_out]))
-            _ = g.create_dataset('params', data=np.array(self.params).astype('S'))
-            _ = g.create_dataset('params_base', data=np.array(self.params_base))
-            g.attrs['layers_num'] = len(self.weights[0])
-            for i in range(len(self.weights)):
-                for j in range(len(self.weights[i])):
-                    _ = g.create_dataset("net_{0}_weight_{1}".format(i, j),
-                                         data=self.weights[i][j].numpy())
-                    _ = g.create_dataset("net_{0}_bias_{1}".format(i, j),
-                                         data=self.biases[i][j].numpy())
-            _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
-            _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
-
-    @classmethod
-    def from_file(cls, file_path, group=None):
-        with h5py.File(file_path, 'r') as f:
-            if group:
-                g = f[group]
-            else:
-                g = f
-            templates_out = g['templates_out'][0]
-            params = list(g["params"][:])
-            params_base = list(g["params_base"][:])
-            num = g.attrs['layers_num']
-            weights = [[g["net_{0}_weight_{1}".format(i, j)][:] for j in range(num)]
-                       for i in range(templates_out)]
-            biases = [[g["net_{0}_bias_{1}".format(i, j)][:] for j in range(num)]
-                      for i in range(templates_out)]
-            l1_reg = g['l1_reg'][0]
-            l2_reg = g['l2_reg'][0]
-
-        if isinstance(params[0], bytes):
-            params = [p.decode() for p in params]
-
-        obj = cls(1, templates_out, [],
-                  params, params_base, l1_reg=l1_reg, l2_reg=l2_reg)
-
-        obj.weights = [[tf.Variable(w, trainable=True, dtype=tf.float32) for w in ws]
-                       for ws in weights]
-        obj.biases = [[tf.Variable(b, trainable=True, dtype=tf.float32) for b in bs]
-                      for bs in biases]
-
-        obj.trainable_weights = {}
-        for i in range(templates_out):
-            for j in range(num):
-                obj.trainable_weights['net_{0}_weight_{1}'.format(i, j)] = obj.weights[i][j]
-                obj.trainable_weights['net_{0}_bias_{1}'.format(i, j)] = obj.biases[i][j]
-
-        return obj
-
-    def plot_model(self, bank, title=None):
-        params = {p: bank.table[p] / pb for p, pb in zip(self.params, self.params_base)}
-        
-        mixer = self.get_mixer(params)
-        mixer = mixer.numpy()
-
-        mtotal = bank.table.mtotal
-        duration = bank.table.template_duration
-
-        fig, ax = plt.subplots(nrows=self.templates_in, ncols=self.templates_out * 2,
-                               figsize=(16 * self.templates_out, 6 * self.templates_in))
-
-        for i in range(self.templates_in):
-            for j in range(self.templates_out):
-                sct = ax[i, j*2].scatter(mtotal, mixer[:, i, j], c=mixer[:, i, j],
-                                         vmin=0, vmax=1,
-                                         cmap="inferno")
-                sct = ax[i, j*2+1].scatter(duration, mixer[:, i, j], c=mixer[:, i, j],
-                                           vmin=0, vmax=1,
-                                           cmap="inferno")
-                ax[i, j*2].set_ylim((0, 1))
-                ax[i, j*2+1].set_ylim((0, 1))
-                ax[i, j*2].set_xscale('log')
-                ax[i, j*2+1].set_xscale('log')
-                ax[i, j*2].grid()
-                ax[i, j*2+1].grid()
-
-        if title:
-            fig.suptitle(title, fontsize="large")
-
-        return fig, ax
-
-    def get_regulariser_loss(self):
-        losses = []
-        for n, w in self.trainable_weights.items():
-            l1_loss = 0.
-            l2_loss = 0.
-            if self.l1_reg:
-                l1_loss = self.l1_reg * tf.reduce_sum(tf.math.abs(w))
-            if self.l2_reg:
-                l2_loss = self.l2_reg * tf.reduce_sum(tf.math.square(w))
-            losses.append(l1_loss + l2_loss)
-        loss = tf.math.add_n(losses)
-        return loss
-
-
 class ChisqFilter(MatchedFilter):
 
-    def __init__(self, freqs, f_low, f_high, transform, mixer=None,
+    def __init__(self, freqs, f_low, f_high, transform,
                  threshold_max=4., constant_max=2., alpha_max=6., beta_max=6.,
                  train_threshold=False, train_constant=False,
                  train_alpha=False, train_beta=False,
                  l1_reg=0., l2_reg=0., leaky_threshold=False):
         super().__init__(freqs, f_low, f_high)
         self.transform = transform
-        self.mixer = mixer
         self.l1_reg = l1_reg
         self.l2_reg = l2_reg
         self.leaky_threshold = leaky_threshold
@@ -565,9 +333,6 @@ class ChisqFilter(MatchedFilter):
         self.trainable_weights = {}
         for k, v in self.transform.trainable_weights.items():
             self.trainable_weights[k] = v
-        if self.mixer:
-            for k, v in self.mixer.trainable_weights.items():
-                self.trainable_weights[k] = v
         if train_threshold:
             self.trainable_weights['threshold'] = self.threshold
         if train_constant:
@@ -617,10 +382,6 @@ class ChisqFilter(MatchedFilter):
         chi_orthos, ortho_lgc = self.transform.get_ortho(chi_temps, temp, psds)
         logging.info("Orthogonal templates created")
 
-        if self.mixer:
-            chi_orthos = self.mixer.mix_temps(chi_orthos, params, training=training)
-            chi_orthos, ortho_lgc = self.transform.get_ortho(chi_orthos, temp, psds)
-
         dof = 2 * tf.shape(chi_orthos)[1]
         dof = tf.cast(dof, tf.float32)
 
@@ -662,10 +423,6 @@ class ChisqFilter(MatchedFilter):
         chi_orthos, ortho_lgc = self.transform.get_ortho(chi_temps, temp, psds)
         logging.info("Orthogonal templates created")
 
-        if self.mixer:
-            chi_orthos = self.mixer.mix_temps(chi_orthos, params, training=training)
-            chi_orthos, ortho_lgc = self.transform.get_ortho(chi_orthos, temp, psds)
-
         dof = 2 * tf.shape(chi_orthos)[1]
         dof = tf.cast(dof, tf.float32)
 
@@ -696,11 +453,6 @@ class ChisqFilter(MatchedFilter):
             config_file, freqs, f_low, f_high, section="transformation"
         )
 
-        if config.has_section("mixer"):
-            mixer = TemplateMixer.from_config(config_file, section="mixer")
-        else:
-            mixer = None
-
         threshold_max = config.getfloat("model", "threshold-max")
         constant_max = config.getfloat("model", "constant-max")
         alpha_max = config.getfloat("model", "alpha-max")
@@ -715,7 +467,7 @@ class ChisqFilter(MatchedFilter):
         l2_reg = config.getfloat("model", "l2-regulariser", fallback=0.)
         leaky_threshold = config.getboolean("model", "leaky-threshold", fallback=False)
 
-        obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
+        obj = cls(freqs, f_low, f_high, transform,
                   threshold_max=threshold_max,
                   constant_max=constant_max,
                   alpha_max=alpha_max,
@@ -758,8 +510,6 @@ class ChisqFilter(MatchedFilter):
         if group is None:
             group = ''
         self.transform.to_file(file_path, group=group + '/transform', append=True)
-        if self.mixer:
-            self.mixer.to_file(file_path, group=group + '/mixer', append=True)
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -784,21 +534,12 @@ class ChisqFilter(MatchedFilter):
             l2_reg = g["l2_reg"][0]
             leaky_threshold = bool(g['leaky_threshold'][0])
 
-            if 'mixer' in g.keys():
-                mixer_check = True
-            else:
-                mixer_check = False
-
         if group is None:
             group = ''
         transform = load_transformation(file_path, freqs, f_low, f_high,
                                         group=group + '/transform')
-        if mixer_check:
-            mixer = TemplateMixer.from_file(file_path, group=group + '/mixer')
-        else:
-            mixer = None
 
-        obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
+        obj = cls(freqs, f_low, f_high, transform,
                   threshold_max=threshold_max,
                   constant_max=constant_max,
                   alpha_max=alpha_max,
@@ -843,8 +584,6 @@ class ChisqFilter(MatchedFilter):
 
     def get_regulariser_loss(self):
         losses = [self.transform.get_regulariser_loss()]
-        if self.mixer:
-            losses += [self.mixer.get_regulariser_loss()]
         if self.train_threshold:
             losses += [self.l1_reg * (self.threshold_max - self.threshold[0])]
             losses += [self.l2_reg * (self.threshold_max - self.threshold[0])]
@@ -1741,7 +1480,6 @@ class CNNTransform(BaseTransform):
         self.to_conv = create_complex_interpolator(self.freqs.numpy(), conv_freqs)
         self.from_conv = create_complex_interpolator(conv_freqs, self.freqs.numpy(), temp_num=channels)
 
-    #@tf.function
     def convolve(self, temp, training=False):
 
         total = real_to_complex(tf.reduce_sum(tf.math.abs(temp), axis=2, keepdims=True))

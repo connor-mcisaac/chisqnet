@@ -37,10 +37,7 @@ setuptools.setup(
              "bin/plot_transform",
              "bin/plot_mixer",
              "bin/plot_model",
-             "bin/plot_per_batch",
-             "bin/plot_timeseries",
-             "bin/select_model",
-             "bin/compare_and_cut"],
+             "bin/select_model"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
