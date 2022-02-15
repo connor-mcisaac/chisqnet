@@ -1,1 +1,1 @@
-# chisq_net
+# chisqnet
