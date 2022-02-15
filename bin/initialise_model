@@ -20,9 +20,6 @@ parser.add_argument("--training-sample-file", required=True,
                     help="Sample file to be used in training")
 parser.add_argument("--validation-sample-file",
                     help="Sample file to be used in training")
-parser.add_argument("--checkpoint-file",
-                    help="Checkpoint file with the latest state of the "
-                         "model to be loaded")
 
 # Gather arguments for filtering/bank
 parser.add_argument("--bank-file", required=True,
@@ -75,13 +72,11 @@ parser.add_argument("--optimizer-keyword-args", nargs='+', default=[],
 
 # Gather arguments for transform
 parser.add_argument("--config-file", required=True,
-                    help="The config gile used to create the transformation")
+                    help="The config file used to create the transformation")
 
 # Gather inputs for output
 parser.add_argument("--output-file", required=True,
                     help="The path of the output file to save the weights and losses")
-parser.add_argument("--checkpoint", type=int, default=1,
-                    help="If given save the weights after this many epochs")
 
 # Gather additional options
 parser.add_argument("--verbose", action='store_true')
@@ -144,31 +139,16 @@ bank = waveform.FilterBank(
 
 freqs = np.arange(training_samples.flen) * training_samples.delta_f
 
-if args.checkpoint_file is None:
-    epoch = 0
-    chisq_transform = ChisqFilter.from_config(
-        args.config_file,
-        freqs, training_samples.flow,
-        training_samples.sample_rate // 2
-    )
-else:
-    with h5py.File(args.checkpoint_file, 'r') as f:
-        epoch = f.attrs['epoch']
-        if 'optimizer_epoch_{0}'.format(epoch) in f.keys():
-            g = f['optimizer_epoch_{0}'.format(epoch)]
-            opt_weights = [g['weight_{0}'.format(i)][()]
-                           for i in range(g.attrs['weights_num'])]
-        else:
-            opt_weights = None
-
-    chisq_transform = ChisqFilter.from_file(
-        args.checkpoint_file,
-        freqs, training_samples.flow,
-        training_samples.sample_rate // 2,
-        group="model_epoch_{0}".format(epoch)
-    )
+chisq_transform = ChisqFilter.from_config(
+    args.config_file,
+    freqs, training_samples.flow,
+    training_samples.sample_rate // 2
+)
 
 train = chisq_transform.trainable_weights
+train = {k: v for k, v in train.items()
+         if k in ['threshold', 'constant', 'alpha', 'beta']}
+
 trainable_names = [k for k in train.keys()]
 trainable_names.sort()
 trainable_weights = [train[k] for k in trainable_names]
@@ -177,17 +157,46 @@ loss_fn = select_loss(args.loss_function).from_cli(args)
 
 optimizer = select_optimizer(args)
 
-if opt_weights:
-    grads = [tf.zeros_like(w) for w in trainable_weights]
-    optimizer.apply_gradients(zip(grads, trainable_weights))
-    optimizer.set_weights(opt_weights)
-
 nbatches = int(np.ceil(1. * training_samples.num / args.batch_size))
-nbatch = epoch * nbatches
+nbatch = 0
 
-output_file_created = False
+all_snrs = []
+all_rchisqs = []
+all_injs = []
+
+val_snrs = []
+val_rchisqs = []
+val_injs = []
+
+losses = []
+batches = []
+
+inj_losses = []
+inj_count = []
+
+trig_losses = []
+trig_count = []
+
+snr_removed = []
+inj_removed = []
+
+val_losses = []
+val_batches = []
+
+val_inj_losses = []
+val_trig_losses = []
+
+val_snr_removeds = []
+val_inj_removeds = []
+
+val_complete = False
 
 for i in range(args.epochs):
+
+    if i == 1:
+        all_snrs = tf.concat(all_snrs, axis=0)
+        all_rchisqs = tf.concat(all_rchisqs, axis=0)
+        all_injs = tf.concat(all_injs, axis=0)
 
     logging.info("Starting epoch")
     logging.info("Starting training")
@@ -196,30 +205,7 @@ for i in range(args.epochs):
     if args.shuffle:
         np.random.shuffle(order)
     
-    losses = []
-    batches = []
-
-    inj_losses = []
-    inj_count = []
-
-    trig_losses = []
-    trig_count = []
-
-    snr_removed = []
-    inj_removed = []
-
-    times = 0.
-
-    val_losses = []
-    val_batches = []
-
-    val_inj_losses = []
-    val_trig_losses = []
-
-    val_snr_removeds = []
-    val_inj_removeds = []
-
-    optimizer.learning_rate = args.learning_rate * args.learning_rate_decay ** (epoch + i)
+    optimizer.learning_rate = args.learning_rate * args.learning_rate_decay ** i
 
     for j in range(nbatches):
 
@@ -231,25 +217,44 @@ for i in range(args.epochs):
 
         logging.info("Starting batch")
 
-        start = time.time()
+        if i == 0:
+            segs, psds, temp, injs, gather_idxs, params = \
+                training_samples.get_tensors(idxs, bank, cuts=True)
 
-        segs, psds, temp, injs, gather_idxs, params = \
-            training_samples.get_tensors(idxs, bank, cuts=True)
+            logging.info("Batch inputs read")
 
-        logging.info("Batch inputs read")
+            with tf.GradientTape() as tape:
 
-        with tf.GradientTape() as tape:
+                snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
+                    temp, segs, psds, params, gather_idxs=gather_idxs,
+                    max_snr=True, training=True
+                )
 
-            snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
-                temp, segs, psds, params, gather_idxs=gather_idxs,
-                max_snr=True, training=True
-            )
+                batch_loss = loss_fn(snr_prime, snr, injs, training=True)
+                loss = tf.reduce_mean(batch_loss)
 
-            batch_loss = loss_fn(snr_prime, snr, injs, training=True)
-            loss = tf.reduce_mean(batch_loss)
+                loss += chisq_transform.get_regulariser_loss()
+                logging.info("Loss calculated")
 
-            loss += chisq_transform.get_regulariser_loss()
-            logging.info("Loss calculated")
+            all_snrs += [snr]
+            all_rchisqs += [rchisq]
+            all_injs += [injs]
+
+        else:
+            idxs = tf.convert_to_tensor(idxs)
+            snr = tf.gather(all_snrs, idxs)
+            rchisq = tf.gather(all_rchisqs, idxs)
+            injs = tf.gather(all_injs, idxs)
+
+            with tf.GradientTape() as tape:
+
+                snr_prime = chisq_transform.get_snr_prime(snr, rchisq, training=True)
+
+                batch_loss = loss_fn(snr_prime, snr, injs, training=True)
+                loss = tf.reduce_mean(batch_loss)
+
+                loss += chisq_transform.get_regulariser_loss()
+                logging.info("Loss calculated")
 
         gradients = tape.gradient(loss, trainable_weights, unconnected_gradients='none')
         logging.info("Gradients calculated")
@@ -273,8 +278,6 @@ for i in range(args.epochs):
         snr_removed += [np.sum(1 - (snr_prime / snr).numpy()[trig_lgc])]
         inj_removed += [np.sum(1 - (snr_prime / snr).numpy()[inj_lgc])]
 
-        times += time.time() - start
-
         nbatch += 1
 
         if j == (nbatches - 1) or (nbatch % args.batches_per_step) == 0:
@@ -286,8 +289,7 @@ for i in range(args.epochs):
               + "Batch: {0:4d}/{1:4d}, ".format(j + 1, nbatches)
               + "Av. Loss: {0:3.4f}, ".format(np.sum(losses) / (j + 1))
               + "Av. Inj Loss: {0:3.4f}, ".format(np.sum(inj_losses) / max(np.sum(inj_count), 1))
-              + "Av. Trig Loss: {0:3.4f}, ".format(np.sum(trig_losses) / max(np.sum(trig_count), 1))
-              + "Av. Time: {0:6.2f}".format(times / (j + 1)),
+              + "Av. Trig Loss: {0:3.4f}, ".format(np.sum(trig_losses) / max(np.sum(trig_count), 1)),
               end=end_str)
 
         if (args.validation_sample_file is None) \
@@ -309,8 +311,6 @@ for i in range(args.epochs):
         val_snr_removed = 0.
         val_inj_removed = 0.
 
-        val_times = 0.
-
         val_trig_snr_primes = []
         val_trig_snrs = []
         val_trig_rchisq = []
@@ -326,17 +326,28 @@ for i in range(args.epochs):
 
             logging.info("Starting batch")
 
-            start = time.time()
+            if not val_complete:
+                segs, psds, temp, injs, gather_idxs, params = \
+                    validation_samples.get_tensors(idxs, bank, cuts=True)
 
-            segs, psds, temp, injs, gather_idxs, params = \
-                validation_samples.get_tensors(idxs, bank, cuts=True)
+                logging.info("Batch inputs read")
+                
+                snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
+                    temp, segs, psds, params, gather_idxs=gather_idxs,
+                    max_snr=True, training=False
+                )
 
-            logging.info("Batch inputs read")
+                val_snrs += [snr]
+                val_rchisqs += [rchisq]
+                val_injs += [injs]
 
-            snr_prime, snr, rchisq = chisq_transform.get_max_snr_prime(
-                temp, segs, psds, params, gather_idxs=gather_idxs,
-                max_snr=True, training=False
-            )
+            else:
+                idxs = tf.convert_to_tensor(idxs)
+                snr = tf.gather(val_snrs, idxs)
+                rchisq = tf.gather(val_rchisqs, idxs)
+                injs = tf.gather(val_injs, idxs)
+
+                snr_prime = chisq_transform.get_snr_prime(snr, rchisq, training=False)
 
             batch_loss = loss_fn(snr_prime, snr, injs, training=False)
             val_loss += tf.reduce_sum(batch_loss)
@@ -366,8 +377,6 @@ for i in range(args.epochs):
                 val_inj_snrs += [snr.numpy()[inj_lgc]]
                 val_inj_rchisq += [rchisq.numpy()[inj_lgc]]
 
-            val_times += time.time() - start
-
             if k == (val_nbatches - 1):
                 end_str = '\n'
             else:
@@ -376,8 +385,7 @@ for i in range(args.epochs):
             print("Batch: {0:4d}/{1:4d}, ".format(k + 1, val_nbatches)
                   + "Av. Loss: {0:3.4f}, ".format(val_loss / total_count)
                   + "Av. Inj Loss: {0:3.4f}, ".format(val_inj_loss / max(val_inj_count, 1))
-                  + "Av. Trig Loss: {0:3.4f}, ".format(val_trig_loss / max(val_trig_count, 1))
-                  + "Av. Time: {0:6.2f}".format(val_times / (k + 1)),
+                  + "Av. Trig Loss: {0:3.4f}, ".format(val_trig_loss / max(val_trig_count, 1)),
                   end=end_str)
 
         val_losses += [val_loss / total_count]
@@ -389,71 +397,66 @@ for i in range(args.epochs):
         val_snr_removeds += [val_snr_removed / val_trig_count]
         val_inj_removeds += [val_inj_removed / val_inj_count]
 
-    if (i + 1) == args.epochs or (args.checkpoint and (i + 1) % args.checkpoint == 0):
-        chisq_transform.to_file(
-            args.output_file,
-            group="model_epoch_{0}".format(epoch + i + 1),
-            append=output_file_created
-        )
+        if not val_complete:
+            val_snrs = tf.concat(val_snrs, axis=0)
+            val_rchisqs = tf.concat(val_rchisqs, axis=0)
+            val_injs = tf.concat(val_injs, axis=0)
+            val_complete = True
 
-        opt_weights = optimizer.get_weights()
-        with h5py.File(args.output_file, 'a') as f:
-            f.attrs['epoch'] = epoch + i + 1
-            g = f.create_group('optimizer_epoch_{0}'.format(epoch + i + 1))
-            g.attrs['weights_num'] = len(opt_weights)
-            for j in range(len(opt_weights)):
-                opt = opt_weights[j]
-                _ = g.create_dataset('weight_{0}'.format(j), data=opt)
+chisq_transform.to_file(
+    args.output_file,
+    group="model_epoch_0",
+    append=False
+)
 
-        output_file_created = True
+inj_losses = np.array(inj_losses) / np.maximum(np.array(inj_count), 1)
+trig_losses = np.array(trig_losses) / np.maximum(np.array(trig_count), 1)
+snr_removed = np.array(snr_removed) / np.maximum(np.array(trig_count), 1)
+inj_removed = np.array(inj_removed) / np.maximum(np.array(inj_count), 1)
 
-    inj_losses = np.array(inj_losses) / np.maximum(np.array(inj_count), 1)
-    trig_losses = np.array(trig_losses) / np.maximum(np.array(trig_count), 1)
-    snr_removed = np.array(snr_removed) / np.maximum(np.array(trig_count), 1)
-    inj_removed = np.array(inj_removed) / np.maximum(np.array(inj_count), 1)
+if len(val_trig_snr_primes):
+    val_trig_snr_primes = np.concatenate(val_trig_snr_primes, axis=0)
+    val_trig_snrs = np.concatenate(val_trig_snrs, axis=0)
+    val_trig_rchisq = np.concatenate(val_trig_rchisq, axis=0)
+if len(val_inj_snr_primes):
+    val_inj_snr_primes = np.concatenate(val_inj_snr_primes, axis=0)
+    val_inj_snrs = np.concatenate(val_inj_snrs, axis=0)
+    val_inj_rchisq = np.concatenate(val_inj_rchisq, axis=0)
 
+with h5py.File(args.output_file, 'a') as f:
+    f.attrs['epoch'] = 0
+    _ = f.create_dataset('training_batch_epoch_0', data=np.array(batches) - batches[-1])
+    _ = f.create_dataset('training_loss_epoch_0', data=np.array(losses))
+    _ = f.create_dataset('training_inj_loss_epoch_0', data=inj_losses)
+    _ = f.create_dataset('training_trig_loss_epoch_0', data=trig_losses)
+    _ = f.create_dataset('training_trig_snr_removed_epoch_0', data=snr_removed)
+    _ = f.create_dataset('training_inj_snr_removed_epoch_0', data=inj_removed)
+
+    if args.validation_sample_file:
+        _ = f.create_dataset('validation_batch_epoch_0',
+                             data=np.array(val_batches) - val_batches[-1])
+        _ = f.create_dataset('validation_loss_epoch_0',
+                             data=np.array(val_losses))
+        _ = f.create_dataset('validation_inj_loss_epoch_0',
+                             data=np.array(val_inj_losses))
+        _ = f.create_dataset('validation_trig_loss_epoch_0',
+                            data=np.array(val_trig_losses))
+        _ = f.create_dataset('validation_trig_snr_removed_epoch_0',
+                             data=np.array(val_snr_removeds))
+        _ = f.create_dataset('validation_inj_snr_removed_epoch_0',
+                             data=np.array(val_inj_removeds))
+        
     if len(val_trig_snr_primes):
-        val_trig_snr_primes = np.concatenate(val_trig_snr_primes, axis=0)
-        val_trig_snrs = np.concatenate(val_trig_snrs, axis=0)
-        val_trig_rchisq = np.concatenate(val_trig_rchisq, axis=0)
+        _ = f.create_dataset('validation_trig_snr_primes_epoch_0',
+                             data=np.array(val_trig_snr_primes))
+        _ = f.create_dataset('validation_trig_snrs_epoch_0',
+                             data=np.array(val_trig_snrs))
+        _ = f.create_dataset('validation_trig_rchisq_epoch_0',
+                             data=np.array(val_trig_rchisq))
     if len(val_inj_snr_primes):
-        val_inj_snr_primes = np.concatenate(val_inj_snr_primes, axis=0)
-        val_inj_snrs = np.concatenate(val_inj_snrs, axis=0)
-        val_inj_rchisq = np.concatenate(val_inj_rchisq, axis=0)
-
-    with h5py.File(args.output_file, 'a') as f:
-        _ = f.create_dataset('training_batch_epoch_{0}'.format(epoch + i + 1), data=np.array(batches))
-        _ = f.create_dataset('training_loss_epoch_{0}'.format(epoch + i + 1), data=np.array(losses))
-        _ = f.create_dataset('training_inj_loss_epoch_{0}'.format(epoch + i + 1), data=inj_losses)
-        _ = f.create_dataset('training_trig_loss_epoch_{0}'.format(epoch + i + 1), data=trig_losses)
-        _ = f.create_dataset('training_trig_snr_removed_epoch_{0}'.format(epoch + i + 1), data=snr_removed)
-        _ = f.create_dataset('training_inj_snr_removed_epoch_{0}'.format(epoch + i + 1), data=inj_removed)
-
-        if args.validation_sample_file:
-            _ = f.create_dataset('validation_batch_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_batches))
-            _ = f.create_dataset('validation_loss_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_losses))
-            _ = f.create_dataset('validation_inj_loss_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_inj_losses))
-            _ = f.create_dataset('validation_trig_loss_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_trig_losses))
-            _ = f.create_dataset('validation_trig_snr_removed_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_snr_removeds))
-            _ = f.create_dataset('validation_inj_snr_removed_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_inj_removeds))
-
-        if len(val_trig_snr_primes):
-            _ = f.create_dataset('validation_trig_snr_primes_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_trig_snr_primes))
-            _ = f.create_dataset('validation_trig_snrs_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_trig_snrs))
-            _ = f.create_dataset('validation_trig_rchisq_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_trig_rchisq))
-        if len(val_inj_snr_primes):
-            _ = f.create_dataset('validation_inj_snr_primes_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_inj_snr_primes))
-            _ = f.create_dataset('validation_inj_snrs_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_inj_snrs))
-            _ = f.create_dataset('validation_inj_rchisq_epoch_{0}'.format(epoch + i + 1),
-                                 data=np.array(val_inj_rchisq))
+        _ = f.create_dataset('validation_inj_snr_primes_epoch_0',
+                             data=np.array(val_inj_snr_primes))
+        _ = f.create_dataset('validation_inj_snrs_epoch_0',
+                             data=np.array(val_inj_snrs))
+        _ = f.create_dataset('validation_inj_rchisq_epoch_0',
+                             data=np.array(val_inj_rchisq))

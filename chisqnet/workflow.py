@@ -287,6 +287,19 @@ class PrepareSamplesExecutable(Executable):
         return node
 
 
+class InitialiseExecutable(Executable):
+    
+    current_retention_level = Executable.MERGED_TRIGGERS
+    def create_node(self, training_samples, validation_samples, bank, config):
+        node = Node(self)
+        node.add_input_opt('--training-sample-file', training_samples)
+        node.add_input_opt('--validation-sample-file', validation_samples)
+        node.add_input_opt('--bank-file', bank)
+        node.add_input_opt('--config-file', config)
+        node.new_output_file_opt(training_samples.segment, '.hdf', '--output-file')
+        return node
+
+
 class TrainingExecutable(Executable):
     
     current_retention_level = Executable.MERGED_TRIGGERS

@@ -14,8 +14,8 @@ from ligo import segments
 from pycbc.workflow import PlotExecutable
 from chisqnet.workflow import (FilterTriggersExecutable, PreprocessingDaxGenerator,
                                MergeSamplesExecutable, StageoutExecutable,
-                               PrepareSamplesExecutable, TrainingExecutable,
-                               MergeModelsExecutable)
+                               PrepareSamplesExecutable, InitialiseExecutable,
+                               TrainingExecutable, MergeModelsExecutable)
 
 
 # Log to the screen until we know where the output file is
@@ -70,7 +70,7 @@ filter_job = FilterTriggersExecutable(workflow.cp, 'filter', out_dir='filtered_t
 sample_files = wf.FileList([])
 sub_dax_jobs = []
 
-subsections = workflow.cp.get_subsections('filter')
+subsections = workflow.cp.get_subsections('workflow-filter')
 for section in subsections:
     logging.info("Creating job for {0}".format(section))
     curr_tags = [section.upper()]
@@ -264,91 +264,100 @@ workflow.add_node(node)
 training_samples = node.output_files[0]
 validation_samples = node.output_files[1]
 
-# Setup training and validation jobs
-file_attrs = {'ifos': workflow.ifos,
-              'segs': training_samples.segment,
-              'tags': []}
-filestr = workflow.cp.get_opt_tags("workflow-train-model", "config-file", [])
-training_config_file = wf.resolve_url_to_file(filestr, attrs=file_attrs)
-
-epochs_total = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-total", []))
-epochs_per = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-per-job", []))
-epochs_per = min(epochs_total, epochs_per)
-
 logging.info("Setting up training jobs")
-training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
-                                  ifos=workflow.ifos, tags=['EPOCHS', '0', str(epochs_per)])
-node = training_job.create_node(epochs_per, training_samples, validation_samples,
-                                bank_file, training_config_file)
-workflow.add_node(node)
-checkpoint_files = [node.output_files[0]]
+training_config_files = wf.FileList([])
+training_names = []
 
-epochs_done = epochs_per
-while epochs_done < epochs_total:
-    epochs_left = epochs_total - epochs_done
-    epochs_next = min(epochs_per, epochs_left)
+subsections = workflow.cp.get_subsections('workflow-train-model')
+for section in subsections:
+    curr_tags = [section.upper()]
+    training_names += [section.upper()]
 
-    training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
-                                      ifos=workflow.ifos,
-                                      tags=['EPOCHS', str(epochs_done), str(epochs_next)])
-    node = training_job.create_node(epochs_next, training_samples, validation_samples,
-                                    bank_file, training_config_file,
-                                    checkpoint=checkpoint_files[-1])
+    # Setup training and validation jobs
+    file_attrs = {'ifos': workflow.ifos,
+                  'segs': training_samples.segment,
+                  'tags': curr_tags}
+
+    filestr = workflow.cp.get_opt_tags("workflow-train-model", "config-file", curr_tags)
+    training_config_file = wf.resolve_url_to_file(filestr, attrs=file_attrs)
+    training_config_files.append(training_config_file)
+
+    epochs_total = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-total", []))
+    epochs_per = int(workflow.cp.get_opt_tags("workflow-train-model", "epochs-per-job", []))
+    epochs_per = min(epochs_total, epochs_per)
+
+    initial_job = InitialiseExecutable(workflow.cp, 'initialise-model', out_dir='trained_model',
+                                       ifos=workflow.ifos, tags=curr_tags)
+    node = initial_job.create_node(training_samples, validation_samples,
+                                   bank_file, training_config_file)
     workflow.add_node(node)
-    checkpoint_files += [node.output_files[0]]
+    checkpoint_files = [node.output_files[0]]
 
-    epochs_done += epochs_next
+    epochs_done = 0
+    while epochs_done < epochs_total:
+        epochs_left = epochs_total - epochs_done
+        epochs_next = min(epochs_per, epochs_left)
 
-logging.info("Training job setup")
+        training_job = TrainingExecutable(workflow.cp, 'train-model', out_dir='trained_model',
+                                          ifos=workflow.ifos,
+                                          tags=curr_tags+['EPOCHS', str(epochs_done), str(epochs_next)])
+        node = training_job.create_node(epochs_next, training_samples, validation_samples,
+                                        bank_file, training_config_file,
+                                        checkpoint=checkpoint_files[-1])
+        workflow.add_node(node)
+        checkpoint_files += [node.output_files[0]]
 
-# Merge training and validation files
-logging.info("Setting up output file merging")
-merge_job = MergeModelsExecutable(workflow.cp, 'merge-models', out_dir='trained_model',
-                                  ifos=workflow.ifos, tags=[])
-node = merge_job.create_node(wf.FileList(checkpoint_files))
-workflow.add_node(node)
-trained_model = node.output_files[0]
+        epochs_done += epochs_next
 
-# Setup plotting jobs
-logging.info("Setting up plotting jobs")
+    logging.info("Training job setup")
 
-loss_job = PlotExecutable(workflow.cp, 'plot-loss', out_dir=rdir['training'],
-                          ifos=workflow.ifos, tags=[])
-node = loss_job.create_node()
-node.add_input_opt('--input-file', trained_model)
-node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
-workflow.add_node(node)
-layout.two_column_layout(rdir['training'], [(node.output_files[0],)])
+    logging.info("Setting up output file merging")
+    merge_job = MergeModelsExecutable(workflow.cp, 'merge-models', out_dir='trained_model',
+                                      ifos=workflow.ifos, tags=curr_tags)
+    node = merge_job.create_node(wf.FileList(checkpoint_files))
+    workflow.add_node(node)
+    trained_model = node.output_files[0]
 
-model_plots = wf.FileList([])
+    # Setup plotting jobs
+    logging.info("Setting up plotting jobs")
 
-transform_job = PlotExecutable(workflow.cp, 'plot-transform', out_dir=rdir['trained_model'],
-                               ifos=workflow.ifos, tags=[])
-node = transform_job.create_node()
-node.add_input_opt('--model-file', trained_model)
-node.add_input_opt('--bank-file', bank_file)
-node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
-workflow.add_node(node)
-model_plots.append(node.output_files[0])
+    loss_job = PlotExecutable(workflow.cp, 'plot-loss', out_dir=rdir['training/{0}'.format(section)],
+                              ifos=workflow.ifos, tags=curr_tags)
+    node = loss_job.create_node()
+    node.add_input_opt('--input-file', trained_model)
+    node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+    workflow.add_node(node)
+    layout.two_column_layout(rdir['training/{0}'.format(section)], [(node.output_files[0],)])
 
-mixer_job = PlotExecutable(workflow.cp, 'plot-mixer', out_dir=rdir['trained_model'],
-                           ifos=workflow.ifos, tags=[])
-node = mixer_job.create_node()
-node.add_input_opt('--model-file', trained_model)
-node.add_input_opt('--bank-file', bank_file)
-node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
-workflow.add_node(node)
-model_plots.append(node.output_files[0])
+    model_plots = wf.FileList([])
 
-model_job = PlotExecutable(workflow.cp, 'plot-model', out_dir=rdir['trained_model'],
-                           ifos=workflow.ifos, tags=[])
-node = model_job.create_node()
-node.add_input_opt('--model-file', trained_model)
-node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
-workflow.add_node(node)
-model_plots.append(node.output_files[0])
+    transform_job = PlotExecutable(workflow.cp, 'plot-transform', out_dir=rdir['trained_model/{0}'.format(section)],
+                                   ifos=workflow.ifos, tags=curr_tags)
+    node = transform_job.create_node()
+    node.add_input_opt('--model-file', trained_model)
+    node.add_input_opt('--bank-file', bank_file)
+    node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+    workflow.add_node(node)
+    model_plots.append(node.output_files[0])
 
-layout.single_layout(rdir['trained_model'], model_plots)
+    mixer_job = PlotExecutable(workflow.cp, 'plot-mixer', out_dir=rdir['trained_model/{0}'.format(section)],
+                               ifos=workflow.ifos, tags=curr_tags)
+    node = mixer_job.create_node()
+    node.add_input_opt('--model-file', trained_model)
+    node.add_input_opt('--bank-file', bank_file)
+    node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+    workflow.add_node(node)
+    model_plots.append(node.output_files[0])
+
+    model_job = PlotExecutable(workflow.cp, 'plot-model', out_dir=rdir['trained_model/{0}'.format(section)],
+                               ifos=workflow.ifos, tags=curr_tags)
+    node = model_job.create_node()
+    node.add_input_opt('--model-file', trained_model)
+    node.new_output_file_opt(trained_model.segment, '.png', '--output-file')
+    workflow.add_node(node)
+    model_plots.append(node.output_files[0])
+
+    layout.single_layout(rdir['trained_model/{0}'.format(section)], model_plots)
 
 # Create results pages
 logging.info("Setting up results pages")
@@ -356,18 +365,22 @@ create_versioning_page(rdir['workflow/version'], container.cp)
 
 base = rdir['workflow/configuration']
 wf.makedir(base)
-model_ini_file_path = os.path.join(base, 'model_configuration.ini')
-with open(training_config_file.storage_path, 'r') as ini:
-    model_ini = ini.read()
-with open(model_ini_file_path, 'w') as ini:
-    ini.write(model_ini)
+ini_files = wf.FileList([])
+
+for i in range(len(training_config_files)):
+    model_ini_file_path = os.path.join(base, 'model_configuration_{0}.ini'.format(training_names[i]))
+    with open(training_config_files[i].storage_path, 'r') as ini:
+        model_ini = ini.read()
+    with open(model_ini_file_path, 'w') as ini:
+        ini.write(model_ini)
+    ini_files.append(wf.File(workflow.ifos, 'MODEL_CONFIG_{0}'.format(training_names[i]),
+                             trained_model.segment, file_url='file://' + model_ini_file_path))
+
 run_ini_file_path = os.path.join(base, 'run_configuration.ini')
 with open(run_ini_file_path, 'w') as ini:
     container.cp.write(ini)
-ini_files = wf.FileList([wf.File(workflow.ifos, 'MODEL_CONFIG', trained_model.segment,
-                                 file_url='file://' + model_ini_file_path),
-                         wf.File(workflow.ifos, 'RUN_CONFIG', trained_model.segment,
-                                 file_url='file://' + run_ini_file_path)])
+ini_files.append(wf.File(workflow.ifos, 'RUN_CONFIG', trained_model.segment,
+                         file_url='file://' + run_ini_file_path))
 layout.single_layout(base, ini_files)
 
 log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', trained_model.segment,

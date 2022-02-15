@@ -28,6 +28,7 @@ setuptools.setup(
              "bin/merge_samples",
              "bin/prepare_samples",
              "bin/manual_stageout",
+             "bin/initialise_model",
              "bin/train_model",
              "bin/validate_model",
              "bin/merge_models",
