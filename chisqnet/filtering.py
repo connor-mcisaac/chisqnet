@@ -527,12 +527,13 @@ class ChisqFilter(MatchedFilter):
                  threshold_max=4., constant_max=2., alpha_max=6., beta_max=6.,
                  train_threshold=False, train_constant=False,
                  train_alpha=False, train_beta=False,
-                 l1_reg=0., l2_reg=0.):
+                 l1_reg=0., l2_reg=0., leaky_threshold=False):
         super().__init__(freqs, f_low, f_high)
         self.transform = transform
         self.mixer = mixer
         self.l1_reg = l1_reg
         self.l2_reg = l2_reg
+        self.leaky_threshold = leaky_threshold
         self.threshold_max = threshold_max
         self.train_threshold = train_threshold
         thresh_const = lambda x: tf.clip_by_value(x, 1., self.threshold_max)
@@ -596,6 +597,17 @@ class ChisqFilter(MatchedFilter):
         max_snr, max_snr_idx = self.get_max_idx(snr, gather_idxs=gather_idxs)
         return max_snr, max_snr_idx
 
+    def get_snr_prime(self, snr, rchisq, training=False):
+        if training and self.leaky_threshold:
+            chisq_mod = (rchisq / self.threshold) ** self.beta
+            chisq_mod = (chisq_mod + self.constant) / (tf.math.tanh(chisq_mod) + self.constant)
+        else:
+            rchisq_thresh = tf.math.maximum(rchisq, tf.ones_like(rchisq) * self.threshold)
+            chisq_mod = (rchisq_thresh / self.threshold) ** self.beta
+            chisq_mod = (chisq_mod + self.constant) / (1. + self.constant)
+        snr_prime = snr / chisq_mod ** (1. / self.alpha)
+        return snr_prime
+
     def get_max_snr_prime(self, temp, segs, psds, params,
                           gather_idxs=None, max_snr=False, training=False):
 
@@ -632,14 +644,7 @@ class ChisqFilter(MatchedFilter):
             chisq = tf.gather_nd(chisq, gather_idxs)
 
         rchisq = chisq / dof
-        if training:
-            chisq_mod = (rchisq / self.threshold) ** self.beta
-            chisq_mod = (chisq_mod + self.constant) / (tf.math.tanh(chisq_mod) + self.constant)
-        else:
-            rchisq_thresh = tf.math.maximum(rchisq, tf.ones_like(rchisq) * self.threshold)
-            chisq_mod = (rchisq_thresh / self.threshold) ** self.beta
-            chisq_mod = (chisq_mod + self.constant) / (1. + self.constant)
-        snr_prime = snr / chisq_mod ** (1. / self.alpha)
+        snr_prime = self.get_snr_prime(snr, rchisq, training=training)
 
         if not max_snr:
             snr_prime, max_idx = self.get_max_idx(snr_prime)
@@ -675,14 +680,7 @@ class ChisqFilter(MatchedFilter):
         chisq = chisq[:, 0]
 
         rchisq = chisq / dof
-        if training:
-            chisq_mod = (rchisq / self.threshold) ** self.beta
-            chisq_mod = (chisq_mod + self.constant) / (tf.math.tanh(chisq_mod) + self.constant)
-        else:
-            rchisq_thresh = tf.math.maximum(rchisq, tf.ones_like(rchisq) * self.threshold)
-            chisq_mod = (rchisq_thresh / self.threshold) ** self.beta
-            chisq_mod = (chisq_mod + self.constant) / (1. + self.constant)
-        snr_prime = snr / chisq_mod ** (1. / self.alpha)
+        snr_prime = self.get_snr_prime(snr, rchisq, training=training)
 
         logging.info("SNR' calculated")
         return snr_prime, snr, rchisq
@@ -715,6 +713,7 @@ class ChisqFilter(MatchedFilter):
 
         l1_reg = config.getfloat("model", "l1-regulariser", fallback=0.)
         l2_reg = config.getfloat("model", "l2-regulariser", fallback=0.)
+        leaky_threshold = config.getboolean("model", "leaky-threshold", fallback=False)
 
         obj = cls(freqs, f_low, f_high, transform, mixer=mixer,
                   threshold_max=threshold_max,
@@ -725,7 +724,8 @@ class ChisqFilter(MatchedFilter):
                   train_constant=train_constant,
                   train_alpha=train_alpha,
                   train_beta=train_beta,
-                  l1_reg=l1_reg, l2_reg=l2_reg)
+                  l1_reg=l1_reg, l2_reg=l2_reg,
+                  leaky_threshold=leaky_threshold)
         return obj
 
     def to_file(self, file_path, group=None, append=False):
@@ -753,6 +753,7 @@ class ChisqFilter(MatchedFilter):
             _ = g.create_dataset("train_beta", data=np.array([int(self.train_beta)]))
             _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
             _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
+            _ = g.create_dataset("leaky_threshold", data=np.array([int(self.leaky_threshold)]))
 
         if group is None:
             group = ''
@@ -781,6 +782,7 @@ class ChisqFilter(MatchedFilter):
             train_beta = bool(g['train_beta'][0])
             l1_reg = g["l1_reg"][0]
             l2_reg = g["l2_reg"][0]
+            leaky_threshold = bool(g['leaky_threshold'][0])
 
             if 'mixer' in g.keys():
                 mixer_check = True
@@ -805,7 +807,8 @@ class ChisqFilter(MatchedFilter):
                   train_constant=train_constant,
                   train_alpha=train_alpha,
                   train_beta=train_beta,
-                  l1_reg=l1_reg, l2_reg=l2_reg)
+                  l1_reg=l1_reg, l2_reg=l2_reg,
+                  leaky_threshold=leaky_threshold)
 
         thresh_const = lambda x: tf.clip_by_value(x, 1., obj.threshold_max)
         obj.threshold = tf.Variable(np.array([threshold], dtype=np.float32),
@@ -1004,8 +1007,9 @@ class ShiftTransform(BaseTransform):
         shift_temp = tf.gather_nd(temp, dj_idxs_f) * dj_idxs_f_mask
 
         def grad(dl_ds):
-            delta = int(0.05 / self.delta_f)
-            ds_df = shift_temp[:, :, 2*delta:] - shift_temp[:, :, :-2*delta]
+            delta_f = 0.1
+            delta = int(delta_f / self.delta_f)
+            ds_df = - (shift_temp[:, :, 2*delta:] - shift_temp[:, :, :-2*delta]) / delta_f
             dl_df_real = tf.math.real(dl_ds[:, :, delta:-delta]) * tf.math.real(ds_df)
             dl_df_imag = tf.math.imag(dl_ds[:, :, delta:-delta]) * tf.math.imag(ds_df)
             dl_df = dl_df_real + dl_df_imag
@@ -1355,17 +1359,24 @@ class NetShiftTransform(ShiftTransform):
             _ = g.create_dataset("dt_max", data=np.array([self.dt_max]))
             _ = g.create_dataset("df_max", data=np.array([self.df_max]))
             _ = g.create_dataset('template_df', data=np.array([self.template_df]))
-            _ = g.create_dataset('layers', data=np.array(self.layers))
+            _ = g.create_dataset('shared_layers', data=np.array(self.shared_layers))
+            _ = g.create_dataset('shift_layers', data=np.array(self.shift_layers))
             _ = g.create_dataset('min_freq', data=np.array([self.min_freq]))
             _ = g.create_dataset('max_freq', data=np.array([self.max_freq]))
             _ = g.create_dataset("l1_reg", data=np.array([self.l1_reg]))
             _ = g.create_dataset("l2_reg", data=np.array([self.l2_reg]))
             _ = g.create_dataset("dropout", data=np.array([self.dropout]))
-            for i in range(len(self.weights)):
-                _ = g.create_dataset("weight_{0}".format(i),
-                                     data=self.weights[i].numpy())
-                _ = g.create_dataset("bias_{0}".format(i),
-                                     data=self.biases[i].numpy())
+            for i in range(len(self.shared_weights)):
+                _ = g.create_dataset("shared_weight_{0}".format(i),
+                                     data=self.shared_weights[i].numpy())
+                _ = g.create_dataset("shared_bias_{0}".format(i),
+                                     data=self.shared_biases[i].numpy())
+            for i in range(len(self.shift_weights)):
+                for j in range(len(self.shift_weights[i])):
+                    _ = g.create_dataset("shift_{0}_weight_{1}".format(i, j),
+                                         data=self.shift_weights[i][j].numpy())
+                    _ = g.create_dataset("shift_{0}_bias_{1}".format(i, j),
+                                         data=self.shift_biases[i][j].numpy())
 
     @classmethod
     def from_file(cls, file_path, freqs, f_low, f_high, group=None):
@@ -1378,35 +1389,56 @@ class NetShiftTransform(ShiftTransform):
             dt_max = g["dt_max"][0]
             df_max = g["df_max"][0]
             template_df = g['template_df'][0]
-            layers = [int(l) for l in g['layers'][:]]
+            shared_layers = [int(l) for l in g['shared_layers'][:]]
+            shift_layers = [int(l) for l in g['shift_layers'][:]]
             min_freq = g['min_freq'][0]
             max_freq = g['max_freq'][0]
             l1_reg = g["l1_reg"][0]
             l2_reg = g["l2_reg"][0]
             dropout = g["dropout"][0]
-            weights = []
-            biases = []
-            means = []
-            variances = []
-            for i in range(len(layers) + 1):
-                weights += [g['weight_{0}'.format(i)][:]]
-                biases += [g['bias_{0}'.format(i)][:]]
+            shared_weights = []
+            shared_biases = []
+            shift_weights = []
+            shift_biases = []
+            for i in range(len(shared_layers)):
+                shared_weights += [g['shared_weight_{0}'.format(i)][:]]
+                shared_biases += [g['shared_bias_{0}'.format(i)][:]]
+            for i in range(nshifts):
+                shift_weights.append([])
+                shift_biases.append([])
+                for j in range(len(shift_layers) + 1):
+                    shift_weights[i] += [g["shift_{0}_weight_{1}".format(i, j)][:]]
+                    shift_biases[i] += [g["shift_{0}_bias_{1}".format(i, j)][:]]
 
         obj = cls(nshifts, dt_max, df_max,
-                  template_df, layers, freqs, f_low, f_high,
+                  template_df, shared_layers, shift_layers,
+                  freqs, f_low, f_high,
                   min_freq=min_freq, max_freq=max_freq,
                   l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
 
-        obj.weights = []
-        obj.biases = []
         obj.trainable_weights = {}
-        for i in range(len(layers) + 1):
-            weight = tf.convert_to_tensor(weights[i], dtype=tf.float32)
-            obj.weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
-            obj.trainable_weights['weight_{0}'.format(i)] = obj.weights[i]
-            bias = tf.convert_to_tensor(biases[i], dtype=tf.float32)
-            obj.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
-            obj.trainable_weights['bias_{0}'.format(i)] = obj.biases[i]
+        obj.shared_weights = []
+        obj.shared_biases = []
+        for i in range(len(shared_layers)):
+            weight = tf.convert_to_tensor(shared_weights[i], dtype=tf.float32)
+            obj.shared_weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+            obj.trainable_weights['shared_weight_{0}'.format(i)] = obj.shared_weights[i]
+            bias = tf.convert_to_tensor(shared_biases[i], dtype=tf.float32)
+            obj.shared_biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+            obj.trainable_weights['shared_bias_{0}'.format(i)] = obj.shared_biases[i]
+
+        obj.shift_weights = []
+        obj.shift_biases = []
+        for i in range(nshifts):
+            obj.shift_weights.append([])
+            obj.shift_biases.append([])
+            for j in range(len(shift_layers) + 1):
+                weight = tf.convert_to_tensor(shift_weights[i][j], dtype=tf.float32)
+                obj.shift_weights[i] += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
+                obj.trainable_weights['shift_{0}_weight_{1}'.format(i, j)] = obj.shift_weights[i][j]
+                bias = tf.convert_to_tensor(shift_biases[i][j], dtype=tf.float32)
+                obj.shift_biases[i] += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
+                obj.trainable_weights['shift_{0}_bias_{1}'.format(i, j)] = obj.shift_biases[i][j]
 
         return obj
 
@@ -1448,124 +1480,6 @@ class NetShiftTransform(ShiftTransform):
         cbar.ax.set_ylabel(param, fontsize='large')
 
         return fig, ax
-
-
-class QuadNetShiftTransform(NetShiftTransform):
-    transformation_type = "quadnetshift"
-
-    def __init__(self, dt_max, df_max, template_df,
-                 shared_layers, shift_layers,
-                 freqs, f_low, f_high,
-                 min_freq=None, max_freq=None,
-                 l1_reg=0., l2_reg=0., dropout=0.):
-        
-        super().__init__(4, dt_max, df_max, template_df,
-                         shared_layers, shift_layers,
-                         freqs, f_low, f_high,
-                         min_freq=min_freq, max_freq=max_freq,
-                         l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
-
-    def dense(self, temp, training=False):
-        ntemp = tf.math.abs(temp)
-        ntemp = self.to_dense(ntemp)
-        ntemp = ntemp / tf.math.reduce_mean(ntemp, axis=2, keepdims=True)
-
-        for i in range(len(self.shared_weights)):
-            if i == 0:
-                feature = tf.matmul(ntemp, self.shared_weights[i]) + self.shared_biases[i]
-            else:
-                feature = tf.matmul(feature, self.shared_weights[i]) + self.shared_biases[i]
-            feature = tf.nn.relu(feature)
-            if training:
-                feature = tf.nn.dropout(feature, self.dropout)
-
-        dts = []
-        dfs = []
-        
-        for i, (t_sign, f_sign) in enumerate(zip([1., 1., -1., -1.], [1., -1., 1., -1.])):
-            for j in range(len(self.shift_weights[i]) - 1):
-                if j == 0:
-                    value = tf.matmul(feature, self.shift_weights[i][j]) + self.shift_biases[i][j]
-                else:
-                    value = tf.matmul(value, self.shift_weights[i][j]) + self.shift_biases[i][j]
-                value = tf.nn.relu(value)
-                if training:
-                    value = tf.nn.dropout(value, self.dropout)
-            value = tf.matmul(value, self.shift_weights[i][-1]) + self.shift_biases[i][-1]
-            value = tf.math.tanh(value) * 0.5
-            dt, df = tf.split(value, 2, axis=2)
-            dts += [dt + 0.5 * t_sign]
-            dfs += [df + 0.5 * f_sign]
-        dts = tf.concat(dts, axis=2)
-        dfs = tf.concat(dfs, axis=2)
-
-        return dts * self.dt_max, dfs * self.df_max
-
-    @classmethod
-    def from_config(cls, config_file, freqs, f_low, f_high, section="model"):
-        config = configparser.ConfigParser()
-        config.read(config_file)
-
-        dt_max = config.getfloat(section, "max-time-shift")
-        df_max = config.getfloat(section, "max-freq-shift")
-        template_df = config.getfloat(section, "template-df")
-        shared_layers = [int(l) for l in config.get(section, "shared-layers").split(',')]
-        shift_layers = [int(l) for l in config.get(section, "shift-layers").split(',')]
-        min_freq = config.getfloat(section, "min-freq", fallback=None)
-        max_freq = config.getfloat(section, "max-freq", fallback=None)
-        l1_reg = config.getfloat(section, "l1-regulariser", fallback=0.)
-        l2_reg = config.getfloat(section, "l2-regulariser", fallback=0.)
-        dropout = config.getfloat(section, "dropout", fallback=0.)
-
-        obj = cls(dt_max, df_max,
-                  template_df, shared_layers, shift_layers,
-                  freqs, f_low, f_high,
-                  min_freq=min_freq, max_freq=max_freq,
-                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
-        return obj
-
-    @classmethod
-    def from_file(cls, file_path, freqs, f_low, f_high, group=None):
-        with h5py.File(file_path, 'r') as f:
-            if group:
-                g = f[group]
-            else:
-                g = f
-            nshifts = g["nshifts"][0]
-            dt_max = g["dt_max"][0]
-            df_max = g["df_max"][0]
-            template_df = g['template_df'][0]
-            layers = [int(l) for l in g['layers'][:]]
-            min_freq = g['min_freq'][0]
-            max_freq = g['max_freq'][0]
-            l1_reg = g["l1_reg"][0]
-            l2_reg = g["l2_reg"][0]
-            dropout = g["dropout"][0]
-            weights = []
-            biases = []
-            means = []
-            variances = []
-            for i in range(len(layers) + 1):
-                weights += [g['weight_{0}'.format(i)][:]]
-                biases += [g['bias_{0}'.format(i)][:]]
-
-        obj = cls(dt_max, df_max,
-                  template_df, layers, freqs, f_low, f_high,
-                  min_freq=min_freq, max_freq=max_freq,
-                  l1_reg=l1_reg, l2_reg=l2_reg, dropout=dropout)
-
-        obj.weights = []
-        obj.biases = []
-        obj.trainable_weights = {}
-        for i in range(len(layers) + 1):
-            weight = tf.convert_to_tensor(weights[i], dtype=tf.float32)
-            obj.weights += [tf.Variable(weight, trainable=True, dtype=tf.float32)]
-            obj.trainable_weights['weight_{0}'.format(i)] = obj.weights[i]
-            bias = tf.convert_to_tensor(biases[i], dtype=tf.float32)
-            obj.biases += [tf.Variable(bias, trainable=True, dtype=tf.float32)]
-            obj.trainable_weights['bias_{0}'.format(i)] = obj.biases[i]
-
-        return obj
 
 
 class Convolution1DTransform(BaseTransform):
@@ -2084,7 +1998,7 @@ class DenseTransform(BaseTransform):
         ntemp = ntemp / tf.reduce_sum(real_to_complex(tf.math.abs(ntemp)),
                                       axis=2, keepdims=True)
 
-        ntemp = ntemp * real_to_complex(tf.math.abs(temp))
+        ntemp = temp * tf.math.abs(ntemp)
         return ntemp
 
     def transform(self, temp, sample, training=False):
@@ -2220,7 +2134,6 @@ def select_transformation(transformation_key):
     options = {
         'polyshift': PolyShiftTransform,
         'netshift': NetShiftTransform,
-        'quadnetshift': QuadNetShiftTransform,
         'convolution': Convolution1DTransform,
         'cnn': CNNTransform,
         'dense': DenseTransform
