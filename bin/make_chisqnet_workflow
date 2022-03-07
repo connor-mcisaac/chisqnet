@@ -3,6 +3,8 @@
 """
 Script for creating a workflow to prepare a training set and train a model
 for chi-squared discriminators.
+Used https://github.com/gwastro/pycbc/blob/v1.18.3/bin/workflows/pycbc_make_coinc_search_workflow
+as a template for this workflow.
 """
 
 import os, argparse, logging, sys, socket, numpy
