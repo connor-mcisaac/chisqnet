@@ -82,6 +82,9 @@ class PreprocessingDaxGenerator(Executable):
 
 
 class PreprocessStrainExecutable(PyCBCInspiralExecutable):
+    """ Modified vesion of the class PyCBCInspiralExecutable
+    Used to preprocess strain for training making sure it is
+    generated in the same way as PyCBC"""
 
     current_retention_level = Executable.ALL_TRIGGERS
     file_input_options = ['--gating-file']
@@ -136,7 +139,11 @@ class PreprocessStrainExecutable(PyCBCInspiralExecutable):
 
 def sngl_ifo_job_setup(workflow, ifo, out_files, curr_exe_job, science_segs,
                        datafind_outs, trigger_file, allow_overlap=True):
-    """ Taken from https://github.com/gwastro/pycbc/blob/0489f33703db64097dc13a0d2385c9ecad913202/pycbc/workflow/jobsetup.py#L456 and edited.
+    """ Taken from https://github.com/gwastro/pycbc/blob/0489f33703db64097dc13a0d2385c9ecad913202/pycbc/workflow/jobsetup.py#L180
+    edited so that we can supply a trigger file and it will check if there are any triggers in each segment.
+    If there are no triggers in a segment then skip it and do not create a job.
+
+
     This function sets up a set of single ifo jobs, skipping them if they contain no triggers.
     A basic overview of how this works is as follows:
     * (1) Identify the length of data that each job needs to read in, and what

@@ -16,16 +16,16 @@ from pycbc.filter import resample_to_delta_t, highpass
 import pycbc.frame
 
 
-# segments functions adapted from SegFile at:
-# https://github.com/gwastro/pycbc/blob/master/pycbc/workflow/core.py
 class ContentHandler(ligolw.LIGOLWContentHandler):
     pass
 
 
 lsctables.use_in(ContentHandler)
 
-
+# segments functions adapted from SegFile at:
+# https://github.com/gwastro/pycbc/blob/master/pycbc/workflow/core.py
 def segmentlistdict_to_xml(segments, output):
+    
     outdoc = ligolw.Document()
     outdoc.appendChild(ligolw.LIGO_LW())
     process = ligolw_process.register_to_xmldoc(outdoc, sys.argv[0], {})
@@ -49,7 +49,7 @@ def segmentlistdict_to_xml(segments, output):
 
 
 def xml_to_segmentlistdict(xml):
-    # load xmldocument and SegmentDefTable and SegmentTables
+
     fp = open(xml, 'rb')
     xmldoc, _ = ligolw_utils.load_fileobj(fp,
                                           gz=xml.endswith(".gz"),
@@ -63,7 +63,6 @@ def xml_to_segmentlistdict(xml):
 
     seg_id = {}
     for seg_def in seg_def_table:
-        # Here we want to encode ifo and segment name
         full_channel_name = ':'.join([str(seg_def.ifos),
                                       str(seg_def.name)])
         seg_id[int(seg_def.segment_def_id)] = full_channel_name
@@ -181,6 +180,9 @@ class StrainSegmentsCut(StrainSegments):
         self.sample_slices = sample_slices
 
 
+# Simplified version of from_cli at:
+# https://github.com/gwastro/pycbc/blob/master/pycbc/strain/strain.py#L173
+# can now take the segment to be loaded as an input used during preprocessing
 def strain_from_cli(ifo, segment, opt,
                     dyn_range_fac=1, precision='single'):
     gating_info = {}
